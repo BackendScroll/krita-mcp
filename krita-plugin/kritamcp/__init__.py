@@ -4,7 +4,7 @@ Allows Claude (or any MCP client) to paint by sending commands to this plugin.
 """
 
 from krita import *
-from PyQt6.QtCore import QTimer, QThread, pyqtSignal, QPointF, QRectF
+from PyQt6.QtCore import QTimer, QThread, pyqtSignal, QPointF, QRectF, QByteArray
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import QMessageBox
 import json
@@ -12,10 +12,56 @@ import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 import os
+import time
+import uuid
+
+from PyQt6.QtGui import QImage
 
 # Configuration - customize these as needed
 SERVER_PORT = 5678
 CANVAS_OUTPUT_DIR = os.path.expanduser("~/krita-mcp-output")
+
+# v3 protocol constants. Bump PROTOCOL_VERSION when the contract changes;
+# clients must negotiate via the `capabilities` action instead of guessing.
+PROTOCOL_VERSION = 3
+PLUGIN_VERSION = "v3-native"
+
+MAX_PATH_POINTS = 512
+MAX_BATCH_ACTIONS = 128
+MAX_CROP_PIXELS = 16 * 1024 * 1024  # 64 MiB raw RGBA; includes a 4096² crop
+MAX_TRANSACTION_BYTES = 512 * 1024 * 1024  # snapshot memory guard
+STRUCTURAL_ACTIONS = {
+    "layer_create", "layer_delete", "layer_duplicate",
+    "layer_merge_down", "batch_actions", "new_canvas",
+}
+
+# Filesystem writes (save/export/capture) are restricted to these roots.
+# Extra roots can be added via KRITA_MCP_ALLOWED_ROOTS (colon-separated).
+def _allowed_roots():
+    roots = [CANVAS_OUTPUT_DIR]
+    extra = os.environ.get("KRITA_MCP_ALLOWED_ROOTS", "")
+    roots.extend(os.path.expanduser(p) for p in extra.split(":") if p)
+    return [os.path.realpath(r) for r in roots]
+
+ALLOWED_ROOTS = _allowed_roots()
+
+
+def _path_allowed(filepath):
+    """Reject writes outside the allowlisted roots (no traversal, no symlinks)."""
+    real = os.path.realpath(os.path.abspath(filepath))
+    for root in ALLOWED_ROOTS:
+        if real == root or real.startswith(root + os.sep):
+            return real
+    return None
+
+
+def _hex_rgb(hx):
+    hx = hx.lstrip("#")
+    return (int(hx[0:2], 16), int(hx[2:4], 16), int(hx[4:6], 16))
+
+
+def _clamp(v, lo, hi):
+    return max(lo, min(hi, v))
 
 class CommandQueue:
     """Thread-safe command queue for passing commands from HTTP thread to main thread."""
@@ -80,15 +126,25 @@ class PaintRequestHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
 
         if parsed.path == '/health':
-            self.send_json_response({"status": "ok", "plugin": "kritamcp"})
+            self.send_json_response({"status": "ok", "plugin": "kritamcp",
+                                    "version": PLUGIN_VERSION})
         elif parsed.path == '/info':
             self.send_json_response({
                 "status": "ok",
                 "canvas_dir": CANVAS_OUTPUT_DIR,
                 "commands": [
+                    # legacy (v2) surface — kept for compatibility
                     "new_canvas", "set_color", "set_brush", "stroke",
                     "fill", "draw_shape", "get_canvas", "undo", "redo",
-                    "clear", "save", "get_color_at", "list_brushes"
+                    "clear", "save", "get_color_at", "list_brushes",
+                    "open_file",
+                    # v3 native surface (see `capabilities` action)
+                    "capabilities", "native_paint_path", "brush_state",
+                    "document_state", "layer_list", "layer_create",
+                    "layer_select", "layer_update", "layer_delete",
+                    "layer_duplicate", "layer_merge_down",
+                    "begin_transaction", "commit_transaction",
+                    "rollback_transaction", "batch_actions", "capture",
                 ]
             })
         else:
@@ -147,6 +203,8 @@ class KritaMCPExtension(Extension):
         self.timer = None
         self.current_brush_size = 20
         self.current_opacity = 1.0
+        # v3: transaction_id -> {node_id: {x, y, w, h, data}} pixel snapshots
+        self.transactions = {}
 
     def setup(self):
         """Called when extension is loaded."""
@@ -213,6 +271,38 @@ class KritaMCPExtension(Extension):
                 return self.cmd_list_brushes(params)
             elif action == "open_file":
                 return self.cmd_open_file(params)
+            elif action == "capabilities":
+                return self.cmd_capabilities(params)
+            elif action == "native_paint_path":
+                return self.cmd_native_paint_path(params)
+            elif action == "brush_state":
+                return self.cmd_brush_state(params)
+            elif action == "document_state":
+                return self.cmd_document_state(params)
+            elif action == "layer_list":
+                return self.cmd_layer_list(params)
+            elif action == "layer_create":
+                return self.cmd_layer_create(params)
+            elif action == "layer_select":
+                return self.cmd_layer_select(params)
+            elif action == "layer_update":
+                return self.cmd_layer_update(params)
+            elif action == "layer_delete":
+                return self.cmd_layer_delete(params)
+            elif action == "layer_duplicate":
+                return self.cmd_layer_duplicate(params)
+            elif action == "layer_merge_down":
+                return self.cmd_layer_merge_down(params)
+            elif action == "begin_transaction":
+                return self.cmd_begin_transaction(params)
+            elif action == "commit_transaction":
+                return self.cmd_commit_transaction(params)
+            elif action == "rollback_transaction":
+                return self.cmd_rollback_transaction(params)
+            elif action == "batch_actions":
+                return self.cmd_batch_actions(params)
+            elif action == "capture":
+                return self.cmd_capture(params)
             else:
                 return {"error": f"Unknown action: {action}"}
 
@@ -325,6 +415,9 @@ class KritaMCPExtension(Extension):
         brush_size = params.get("size", self.current_brush_size)
         hardness = params.get("hardness", 0.5)  # 0.0 = very soft, 1.0 = hard edge
         opacity = params.get("opacity", 1.0)
+        colors_in = params.get("colors") or []
+        taper_in = params.get("taper") or []
+        grain = max(0.0, min(1.0, float(params.get("grain", 0.0) or 0.0)))
 
         if len(points) < 2:
             return {"error": "Need at least 2 points for a stroke"}
@@ -344,15 +437,41 @@ class KritaMCPExtension(Extension):
         qcolor = fg.colorForCanvas(view.canvas())
         r, g, b = qcolor.red(), qcolor.green(), qcolor.blue()
 
+        def hex_rgb(hx):
+            hx = hx.lstrip("#")
+            return (int(hx[0:2], 16), int(hx[2:4], 16), int(hx[4:6], 16))
+
+        point_colors = None
+        if len(colors_in) == len(points):
+            try:
+                point_colors = [hex_rgb(c) for c in colors_in]
+            except Exception:
+                point_colors = None
+        point_tapers = None
+        if len(taper_in) == len(points):
+            try:
+                point_tapers = [max(0.05, float(t)) for t in taper_in]
+            except Exception:
+                point_tapers = None
+
+        import math
+        import random
+        rng = random.Random(4242)
+
+        def point_radius(i):
+            t = point_tapers[i] if point_tapers else 1.0
+            return max(1, int(round(brush_size * t / 2.0)))
+
+        max_radius = max(point_radius(i) for i in range(len(points)))
+
         width = doc.width()
         height = doc.height()
-        radius = max(1, brush_size // 2)
 
-        # Calculate bounding box for all points plus brush radius
-        min_x = max(0, int(min(p[0] for p in points)) - radius - 2)
-        min_y = max(0, int(min(p[1] for p in points)) - radius - 2)
-        max_x = min(width, int(max(p[0] for p in points)) + radius + 2)
-        max_y = min(height, int(max(p[1] for p in points)) + radius + 2)
+        # Calculate bounding box for all points plus max brush radius
+        min_x = max(0, int(min(p[0] for p in points)) - max_radius - 2)
+        min_y = max(0, int(min(p[1] for p in points)) - max_radius - 2)
+        max_x = min(width, int(max(p[0] for p in points)) + max_radius + 2)
+        max_y = min(height, int(max(p[1] for p in points)) + max_radius + 2)
 
         w = max_x - min_x
         h = max_y - min_y
@@ -366,75 +485,76 @@ class KritaMCPExtension(Extension):
 
         import math
 
-        def draw_soft_circle(cx, cy, point_opacity=1.0):
-            """Draw a soft circle with falloff at canvas coordinates."""
+        def falloff(dist, radius):
+            if radius <= 0:
+                return 0.0
+            d = dist / radius
+            if hardness >= 1.0:
+                return 1.0
+            if d < hardness:
+                return 1.0
+            fall = (d - hardness) / (1.0 - hardness)
+            return max(0.0, 1.0 - fall)
+
+        def stamp(cx, cy, radius, col):
+            """One soft stamp with optional grain, blending onto the layer."""
             for dy in range(-radius, radius + 1):
                 for dx in range(-radius, radius + 1):
                     dist_sq = dx*dx + dy*dy
-                    if dist_sq <= radius*radius:
-                        px = int(cx) + dx - min_x
-                        py = int(cy) + dy - min_y
-                        if 0 <= px < w and 0 <= py < h:
-                            # Calculate distance from center (0.0 to 1.0)
-                            dist = math.sqrt(dist_sq) / radius if radius > 0 else 0
+                    if dist_sq > radius*radius:
+                        continue
+                    px = int(cx) + dx - min_x
+                    py = int(cy) + dy - min_y
+                    if not (0 <= px < w and 0 <= py < h):
+                        continue
+                    af = falloff(math.sqrt(dist_sq), radius)
+                    a = int(255 * af * opacity)
+                    if a <= 0:
+                        continue
+                    idx = (py * w + px) * 4
+                    er, eg, eb = pixels[idx+2], pixels[idx+1], pixels[idx]
+                    cr, cg, cb = col
+                    if grain > 0.0:
+                        n = 1.0 + rng.uniform(-grain, grain)
+                        cr = min(255, max(0, int(cr * n)))
+                        cg = min(255, max(0, int(cg * n)))
+                        cb = min(255, max(0, int(cb * n)))
+                    blend = a / 255.0
+                    pixels[idx]   = int(eb * (1 - blend) + cb * blend)
+                    pixels[idx+1] = int(eg * (1 - blend) + cg * blend)
+                    pixels[idx+2] = int(er * (1 - blend) + cr * blend)
+                    pixels[idx+3] = max(pixels[idx+3], a)
 
-                            # Apply hardness curve
-                            # hardness=1.0: sharp edge, hardness=0.0: gradual fade from center
-                            if hardness >= 1.0:
-                                alpha_factor = 1.0
-                            else:
-                                # Soft falloff: starts fading at hardness point
-                                if dist < hardness:
-                                    alpha_factor = 1.0
-                                else:
-                                    # Smooth falloff from hardness to edge
-                                    falloff = (dist - hardness) / (1.0 - hardness) if hardness < 1.0 else 0
-                                    alpha_factor = 1.0 - falloff
+        def stamp_segment(i, j):
+            x1, y1 = points[i]
+            x2, y2 = points[j]
+            r1, r2 = point_radius(i), point_radius(j)
+            c1 = point_colors[i] if point_colors else (r, g, b)
+            c2 = point_colors[j] if point_colors else (r, g, b)
+            dist = math.hypot(x2 - x1, y2 - y1)
+            steps = max(1, int(dist / max(1, min(r1, r2) / 3.0)))
+            for k in range(steps + 1):
+                t = k / steps
+                cx = x1 + (x2 - x1) * t
+                cy = y1 + (y2 - y1) * t
+                rad = max(1, int(round(r1 + (r2 - r1) * t)))
+                col = (int(c1[0] + (c2[0] - c1[0]) * t),
+                       int(c1[1] + (c2[1] - c1[1]) * t),
+                       int(c1[2] + (c2[2] - c1[2]) * t))
+                stamp(cx, cy, rad, col)
 
-                            final_alpha = int(255 * alpha_factor * opacity * point_opacity)
-
-                            if final_alpha > 0:
-                                idx = (py * w + px) * 4
-                                # Alpha blending with existing pixel
-                                existing_b = pixels[idx]
-                                existing_g = pixels[idx+1]
-                                existing_r = pixels[idx+2]
-                                existing_a = pixels[idx+3]
-
-                                # Simple alpha blend
-                                blend = final_alpha / 255.0
-                                new_r = int(existing_r * (1 - blend) + r * blend)
-                                new_g = int(existing_g * (1 - blend) + g * blend)
-                                new_b = int(existing_b * (1 - blend) + b * blend)
-                                new_a = max(existing_a, final_alpha)
-
-                                pixels[idx] = new_b
-                                pixels[idx+1] = new_g
-                                pixels[idx+2] = new_r
-                                pixels[idx+3] = new_a
-
-        def draw_line(x1, y1, x2, y2):
-            """Draw a line using interpolation with soft brush circles."""
-            dist = math.sqrt((x2 - x1)**2 + (y2 - y1)**2)
-            # More steps for smoother lines
-            steps = max(1, int(dist / max(1, radius / 3)))
-
-            for i in range(steps + 1):
-                t = i / steps if steps > 0 else 0
-                x = x1 + t * (x2 - x1)
-                y = y1 + t * (y2 - y1)
-                draw_soft_circle(x, y)
-
-        # Draw soft circles at each point and lines between them
         for i in range(len(points)):
-            draw_soft_circle(points[i][0], points[i][1])
+            stamp(points[i][0], points[i][1], point_radius(i),
+                  point_colors[i] if point_colors else (r, g, b))
             if i > 0:
-                draw_line(points[i-1][0], points[i-1][1], points[i][0], points[i][1])
+                stamp_segment(i - 1, i)
 
         layer.setPixelData(bytes(pixels), min_x, min_y, w, h)
         doc.refreshProjection()
 
-        return {"status": "ok", "points_count": len(points), "hardness": hardness}
+        return {"status": "ok", "points_count": len(points), "hardness": hardness,
+                "colors": point_colors is not None, "taper": point_tapers is not None,
+                "grain": grain}
 
     def cmd_fill(self, params):
         """Fill a circular area with current color."""
@@ -745,6 +865,568 @@ class KritaMCPExtension(Extension):
             window.addView(doc)
 
         return {"status": "ok", "path": filepath, "name": doc.name(), "width": doc.width(), "height": doc.height()}
+
+    # ------------------------------------------------------------------ v3
+    # Native surface. See docs/AUTOPAINTER/KRITA_MCP_SERVER_REQUIREMENTS.md.
+    # Capabilities must be queried before using these actions; never assume.
+
+    def cmd_capabilities(self, params):
+        return {
+            "status": "ok",
+            "plugin": "kritamcp",
+            "plugin_version": PLUGIN_VERSION,
+            "protocol_version": PROTOCOL_VERSION,
+            "actions": [
+                "native_paint_path", "brush_state", "document_state",
+                "layer_list", "layer_create", "layer_select",
+                "layer_update", "layer_delete", "layer_duplicate",
+                "layer_merge_down", "begin_transaction",
+                "commit_transaction", "rollback_transaction",
+                "batch_actions", "capture", "save", "get_color_at",
+                "list_brushes", "open_file", "new_canvas",
+            ],
+            "native_brush_engine": True,
+            "per_point_pressure": True,
+            "reserved_fields": ["tilt", "rotation", "speed"],
+            "history_grouping": False,
+            "stable_resource_ids": False,  # scripting API exposes names only
+            "stable_node_ids": True,       # QUuid via nodeByUniqueID
+            "transaction_mode": "pixel_snapshot",
+            "transaction_scope": "paint_layer_pixels_only",
+            "transaction_notes": (
+                "Rollback restores pixel data of existing paint layers. "
+                "Structural changes (layer create/delete/merge) are NOT "
+                "rolled back; animated documents are unsupported."),
+            "allowlisted_roots": ALLOWED_ROOTS,
+            "limits": {
+                "max_path_points": MAX_PATH_POINTS,
+                "max_batch_actions": MAX_BATCH_ACTIONS,
+                "max_crop_pixels": MAX_CROP_PIXELS,
+            },
+        }
+
+    def _resolve_document(self, params):
+        """Return (doc, error). Honours params['document'] (document name)."""
+        doc_name = params.get("document")
+        if not doc_name:
+            return self.get_active_document(), None
+        for d in Krita.instance().documents():
+            if d.name() == doc_name:
+                return d, None
+        return None, {"error": f"Document not found: {doc_name}"}
+
+    def _resolve_node(self, doc, node_id=None):
+        """Return (node, error). Honours params['node_id'] (node QUuid)."""
+        if not node_id:
+            return doc.activeNode(), None
+        node = doc.nodeByUniqueID(node_id)
+        if node is None:
+            return None, {"error": f"Node not found: {node_id}"}
+        return node, None
+
+    def _apply_preset(self, view, preset_name):
+        found = None
+        for name, preset in Krita.instance().resources("preset").items():
+            if name == preset_name:
+                found = preset
+                break
+        if found is None:
+            for name, preset in Krita.instance().resources("preset").items():
+                if preset_name.lower() in name.lower():
+                    found = preset
+                    break
+        if not found:
+            return False
+        view.setCurrentBrushPreset(found)
+        return True
+
+    def cmd_native_paint_path(self, params):
+        """Pressure-aware path painted by Krita's native brush engine.
+
+        Uses Node.paintLine() per consecutive point pair. The current brush
+        preset, size, opacity, flow and colours are taken from canvas view
+        resources (set here from the request). Each segment is one undo
+        entry; grouping is not exposed by the scripting API.
+        """
+        view = self.get_active_view()
+        if not view:
+            return {"error": "No active view"}
+        doc, err = self._resolve_document(params)
+        if err:
+            return err
+        layer, err = self._resolve_node(doc, params.get("node_id"))
+        if err:
+            return err
+        if layer is None:
+            return {"error": "No active layer"}
+
+        points = params.get("points", [])
+        if len(points) < 2:
+            return {"error": "Need at least 2 points for a path"}
+        if len(points) > MAX_PATH_POINTS:
+            return {"error": f"Too many path points (max {MAX_PATH_POINTS})"}
+
+        norm_points = []
+        for p in points:
+            if isinstance(p, dict):
+                px, py = float(p.get("x", 0)), float(p.get("y", 0))
+                pr = _clamp(float(p.get("pressure", 1.0)), 0.0, 1.0)
+            else:
+                px, py = float(p[0]), float(p[1])
+                pr = 1.0
+            norm_points.append((px, py, pr))
+
+        kind = params.get("kind", "paint")
+        if kind not in ("paint", "erase"):
+            return {"error": f"Unknown path kind: {kind}"}
+
+        prev_eraser = view.eraserMode()
+        prev_pressure_disabled = view.disablePressure()
+        try:
+            preset_name = params.get("preset")
+            if preset_name and not self._apply_preset(view, preset_name):
+                return {"error": f"Brush preset not found: {preset_name}"}
+            if params.get("size") is not None:
+                view.setBrushSize(_clamp(float(params["size"]), 1.0, 4000.0))
+            if params.get("opacity") is not None:
+                view.setPaintingOpacity(_clamp(float(params["opacity"]), 0.0, 1.0))
+            if params.get("flow") is not None:
+                view.setPaintingFlow(_clamp(float(params["flow"]), 0.0, 1.0))
+            if params.get("blending_mode"):
+                view.setCurrentBlendingMode(str(params["blending_mode"]))
+            if params.get("colour"):
+                color = QColor(str(params["colour"]))
+                view.setForeGroundColor(
+                    ManagedColor.fromQColor(color, view.canvas()))
+            # Per-point pressures must reach the brush engine.
+            view.setDisablePressure(False)
+            view.setEraserMode(kind == "erase")
+
+            stroke_style = "ForegroundColor" if kind == "paint" else "None"
+            start = time.time()
+            for i in range(1, len(norm_points)):
+                x1, y1, p1 = norm_points[i - 1]
+                x2, y2, p2 = norm_points[i]
+                layer.paintLine(QPointF(x1, y1), QPointF(x2, y2), p1, p2,
+                                stroke_style)
+            doc.refreshProjection()
+            elapsed_ms = int((time.time() - start) * 1000)
+        finally:
+            view.setEraserMode(prev_eraser)
+            view.setDisablePressure(prev_pressure_disabled)
+
+        size = view.brushSize()
+        pad = size / 2.0 + 2.0
+        xs = [p[0] for p in norm_points]
+        ys = [p[1] for p in norm_points]
+        bbox = [
+            max(0, int(min(xs) - pad)),
+            max(0, int(min(ys) - pad)),
+            min(doc.width(), int(max(xs) + pad) + 1) - max(0, int(min(xs) - pad)),
+            min(doc.height(), int(max(ys) + pad) + 1) - max(0, int(min(ys) - pad)),
+        ]
+        return {
+            "status": "ok",
+            "kind": kind,
+            "points_count": len(norm_points),
+            "size": size,
+            "opacity": view.paintingOpacity(),
+            "flow": view.paintingFlow(),
+            "bbox": bbox,
+            "render_ms": elapsed_ms,
+        }
+
+    def cmd_brush_state(self, params):
+        """Read (and optionally write) brush/tool state. Empty params = read."""
+        view = self.get_active_view()
+        if not view:
+            return {"error": "No active view"}
+
+        if params.get("preset"):
+            if not self._apply_preset(view, params["preset"]):
+                return {"error": f"Brush preset not found: {params['preset']}"}
+        if params.get("size") is not None:
+            view.setBrushSize(_clamp(float(params["size"]), 1.0, 4000.0))
+        if params.get("opacity") is not None:
+            view.setPaintingOpacity(_clamp(float(params["opacity"]), 0.0, 1.0))
+        if params.get("flow") is not None:
+            view.setPaintingFlow(_clamp(float(params["flow"]), 0.0, 1.0))
+        if params.get("blending_mode"):
+            view.setCurrentBlendingMode(str(params["blending_mode"]))
+        if params.get("eraser") is not None:
+            view.setEraserMode(bool(params["eraser"]))
+        if params.get("disable_pressure") is not None:
+            view.setDisablePressure(bool(params["disable_pressure"]))
+        if params.get("colour"):
+            view.setForeGroundColor(ManagedColor.fromQColor(
+                QColor(str(params["colour"])), view.canvas()))
+        if params.get("background"):
+            view.setBackGroundColor(ManagedColor.fromQColor(
+                QColor(str(params["background"])), view.canvas()))
+
+        preset = view.currentBrushPreset()
+        fg = view.foregroundColor().colorForCanvas(view.canvas())
+        bg = view.backgroundColor().colorForCanvas(view.canvas())
+        return {
+            "status": "ok",
+            "preset": preset.name() if preset else None,
+            "preset_id": preset.name() if preset else None,  # names only today
+            "size": view.brushSize(),
+            "opacity": view.paintingOpacity(),
+            "flow": view.paintingFlow(),
+            "blending_mode": view.currentBlendingMode(),
+            "eraser": view.eraserMode(),
+            "disable_pressure": view.disablePressure(),
+            "colour": "#{:02x}{:02x}{:02x}".format(fg.red(), fg.green(), fg.blue()),
+            "background": "#{:02x}{:02x}{:02x}".format(bg.red(), bg.green(), bg.blue()),
+        }
+
+    def cmd_document_state(self, params):
+        doc, err = self._resolve_document(params)
+        if err:
+            return err
+        if not doc:
+            return {"error": "No active document"}
+        active = doc.activeNode()
+        return {
+            "status": "ok",
+            "document_id": doc.name(),  # scripting API exposes names only
+            "name": doc.name(),
+            "file_path": doc.fileName(),
+            "width": doc.width(),
+            "height": doc.height(),
+            "resolution": doc.resolution(),
+            "color_model": doc.colorModel(),
+            "color_depth": doc.colorDepth(),
+            "color_profile": doc.colorProfile(),
+            "active_node_id": active.uniqueId().toString() if active else None,
+            "active_node_name": active.name() if active else None,
+            "modified": doc.modified(),
+        }
+
+    def _node_entry(self, node):
+        entry = {
+            "id": node.uniqueId().toString(),
+            "name": node.name(),
+            "type": node.type(),
+            "visible": node.visible(),
+            "opacity": node.opacity(),
+            "blend_mode": node.blendingMode(),
+            "locked": node.locked(),
+            "alpha_locked": node.alphaLocked(),
+            "inherit_alpha": node.inheritAlpha(),
+            "children": [],
+        }
+        for child in node.childNodes():
+            entry["children"].append(self._node_entry(child))
+        return entry
+
+    def cmd_layer_list(self, params):
+        doc, err = self._resolve_document(params)
+        if err:
+            return err
+        if not doc:
+            return {"error": "No active document"}
+        return {"status": "ok", "root": self._node_entry(doc.rootNode())}
+
+    def cmd_layer_create(self, params):
+        doc, err = self._resolve_document(params)
+        if err:
+            return err
+        if not doc:
+            return {"error": "No active document"}
+        name = params.get("name", "layer")
+        node_type = params.get("type", "paintlayer")
+        parent, err = self._resolve_node(doc, params.get("parent_id"))
+        if err:
+            return err
+        node = doc.createNode(name, node_type)
+        if node is None:
+            return {"error": f"Could not create node of type {node_type}"}
+        if params.get("above_id"):
+            above, aerr = self._resolve_node(doc, params["above_id"])
+            if aerr:
+                return aerr
+            parent.addChildNode(node, above)
+        else:
+            parent.addChildNode(node, None)
+        if params.get("select", True):
+            doc.setActiveNode(node)
+        doc.refreshProjection()
+        return {"status": "ok", "id": node.uniqueId().toString(),
+                "name": node.name(), "type": node.type()}
+
+    def cmd_layer_select(self, params):
+        doc, err = self._resolve_document(params)
+        if err:
+            return err
+        if not doc:
+            return {"error": "No active document"}
+        node, err = self._resolve_node(doc, params.get("node_id"))
+        if err:
+            return err
+        if node is None:
+            node = doc.nodeByName(params.get("name", ""))
+            if node is None:
+                return {"error": "Node not found"}
+        doc.setActiveNode(node)
+        return {"status": "ok", "id": node.uniqueId().toString(),
+                "name": node.name()}
+
+    def cmd_layer_update(self, params):
+        doc, err = self._resolve_document(params)
+        if err:
+            return err
+        if not doc:
+            return {"error": "No active document"}
+        node, err = self._resolve_node(doc, params.get("node_id"))
+        if err:
+            return err
+        if node is None:
+            return {"error": "Node not found"}
+        if params.get("name"):
+            node.setName(str(params["name"]))
+        if params.get("visible") is not None:
+            node.setVisible(bool(params["visible"]))
+        if params.get("locked") is not None:
+            node.setLocked(bool(params["locked"]))
+        if params.get("alpha_locked") is not None:
+            node.setAlphaLocked(bool(params["alpha_locked"]))
+        if params.get("inherit_alpha") is not None:
+            node.setInheritAlpha(bool(params["inherit_alpha"]))
+        if params.get("opacity") is not None:
+            node.setOpacity(_clamp(int(params["opacity"]), 0, 255))
+        if params.get("blend_mode"):
+            node.setBlendingMode(str(params["blend_mode"]))
+        if params.get("move_x") or params.get("move_y"):
+            node.move(int(params.get("move_x", 0)), int(params.get("move_y", 0)))
+        doc.refreshProjection()
+        return {"status": "ok", "id": node.uniqueId().toString()}
+
+    def cmd_layer_delete(self, params):
+        doc, err = self._resolve_document(params)
+        if err:
+            return err
+        if not doc:
+            return {"error": "No active document"}
+        node, err = self._resolve_node(doc, params.get("node_id"))
+        if err:
+            return err
+        if node is None:
+            return {"error": "Node not found"}
+        ok = node.remove()
+        doc.refreshProjection()
+        return {"status": "ok"} if ok else {"error": "remove() failed"}
+
+    def cmd_layer_duplicate(self, params):
+        doc, err = self._resolve_document(params)
+        if err:
+            return err
+        if not doc:
+            return {"error": "No active document"}
+        node, err = self._resolve_node(doc, params.get("node_id"))
+        if err:
+            return err
+        if node is None:
+            return {"error": "Node not found"}
+        clone = node.clone()
+        parent = node.parentNode()
+        if not parent.addChildNode(clone, node):
+            return {"error": "addChildNode failed"}
+        doc.refreshProjection()
+        return {"status": "ok", "id": clone.uniqueId().toString(),
+                "name": clone.name()}
+
+    def cmd_layer_merge_down(self, params):
+        doc, err = self._resolve_document(params)
+        if err:
+            return err
+        if not doc:
+            return {"error": "No active document"}
+        node, err = self._resolve_node(doc, params.get("node_id"))
+        if err:
+            return err
+        if node is None:
+            return {"error": "Node not found"}
+        merged = node.mergeDown()
+        if merged is None:
+            return {"error": "mergeDown failed"}
+        doc.refreshProjection()
+        return {"status": "ok", "id": merged.uniqueId().toString(),
+                "name": merged.name()}
+
+    def _snapshot_paint_layers(self, doc, node):
+        snapshot = {}
+        w, h = doc.width(), doc.height()
+        for child in node.childNodes():
+            snapshot.update(self._snapshot_paint_layers(doc, child))
+        if node.type() in ("paintlayer",) and node.hasExtents():
+            snapshot[node.uniqueId().toString()] = {
+                "x": 0, "y": 0, "w": w, "h": h,
+                "data": bytes(node.pixelData(0, 0, w, h)),
+            }
+        return snapshot
+
+    def cmd_begin_transaction(self, params):
+        doc, err = self._resolve_document(params)
+        if err:
+            return err
+        if not doc:
+            return {"error": "No active document"}
+        tid = str(uuid.uuid4())
+        snapshot = self._snapshot_paint_layers(doc, doc.rootNode())
+        total_bytes = sum(s["w"] * s["h"] * 4 for s in snapshot.values())
+        if total_bytes > MAX_TRANSACTION_BYTES:
+            return {
+                "error": (
+                    f"Transaction snapshot would need ~{total_bytes // (1024 * 1024)} MB "
+                    f"(limit {MAX_TRANSACTION_BYTES // (1024 * 1024)} MB); "
+                    "reduce canvas size or paint layers"),
+            }
+        self.transactions[tid] = {
+            "document": doc.name(),
+            "label": params.get("label", ""),
+            "snapshot": snapshot,
+            "created": time.time(),
+        }
+        return {"status": "ok", "transaction_id": tid,
+                "nodes": len(self.transactions[tid]["snapshot"])}
+
+    def cmd_commit_transaction(self, params):
+        tid = params.get("transaction_id")
+        if tid not in self.transactions:
+            return {"error": f"Unknown transaction: {tid}"}
+        nodes = len(self.transactions.pop(tid)["snapshot"])
+        return {"status": "ok", "transaction_id": tid, "released_nodes": nodes}
+
+    def cmd_rollback_transaction(self, params):
+        tid = params.get("transaction_id")
+        if tid not in self.transactions:
+            return {"error": f"Unknown transaction: {tid}"}
+        txn = self.transactions.pop(tid)
+        doc, err = self._resolve_document({"document": txn["document"]})
+        if err or not doc:
+            return {"error": "Document for transaction is gone"}
+        restored = 0
+        for node_id, snap in txn["snapshot"].items():
+            node = doc.nodeByUniqueID(node_id)
+            if node is None:
+                continue
+            node.setPixelData(QByteArray(snap["data"]), snap["x"], snap["y"],
+                              snap["w"], snap["h"])
+            restored += 1
+        doc.refreshProjection()
+        return {"status": "ok", "transaction_id": tid, "restored_nodes": restored}
+
+    def cmd_batch_actions(self, params):
+        """Execute a list of {action, params} in order, with optional atomicity.
+
+        atomic=true wraps the batch in a pixel-snapshot transaction and rolls
+        back if any action errors, so a batch is accepted or rejected as one
+        candidate — the AutoPainter contract.
+        """
+        actions = params.get("actions", [])
+        if not actions:
+            return {"error": "No actions supplied"}
+        if len(actions) > MAX_BATCH_ACTIONS:
+            return {"error": f"Too many actions (max {MAX_BATCH_ACTIONS})"}
+
+        atomic = bool(params.get("atomic", True))
+        if atomic:
+            structural = [a.get("action") for a in actions
+                          if a.get("action") in STRUCTURAL_ACTIONS]
+            if structural:
+                return {
+                    "error": (
+                        "Structural actions cannot be part of an atomic "
+                        "batch (pixel-snapshot rollback covers paint-layer "
+                        "pixels only): " + ", ".join(structural)),
+                }
+        tid = None
+        if atomic:
+            t = self.cmd_begin_transaction({"label": "batch_actions"})
+            if "error" in t:
+                return t
+            tid = t["transaction_id"]
+
+        results = []
+        failed = False
+        start = time.time()
+        for entry in actions:
+            sub_action = entry.get("action")
+            sub_params = entry.get("params", {})
+            if sub_action == "batch_actions":
+                result = {"error": "Nested batch_actions are not allowed"}
+            else:
+                result = self.execute_command(
+                    {"action": sub_action, "params": sub_params})
+            results.append(result)
+            if "error" in result and not failed:
+                failed = True
+                if atomic:
+                    break
+
+        rolled_back = False
+        if failed and atomic:
+            rb = self.cmd_rollback_transaction({"transaction_id": tid})
+            rolled_back = "error" not in rb
+        elif atomic:
+            self.cmd_commit_transaction({"transaction_id": tid})
+
+        return {
+            "status": "error" if failed else "ok",
+            "results": results,
+            "executed": len(results),
+            "rolled_back": rolled_back,
+            "elapsed_ms": int((time.time() - start) * 1000),
+        }
+
+    def cmd_capture(self, params):
+        """Capture a crop of the composite projection (or a node) as PNG.
+
+        Returns the file path under an allowlisted root. Optional max_side
+        downsamples with smooth scaling. Bounded by MAX_CROP_PIXELS.
+        """
+        doc, err = self._resolve_document(params)
+        if err:
+            return err
+        if not doc:
+            return {"error": "No active document"}
+
+        x = int(params.get("x", 0))
+        y = int(params.get("y", 0))
+        w = int(params.get("w", doc.width()))
+        h = int(params.get("h", doc.height()))
+        if w * h > MAX_CROP_PIXELS:
+            return {"error": "Crop exceeds max_crop_pixels"}
+
+        node_id = params.get("node_id")
+        if node_id:
+            node, nerr = self._resolve_node(doc, node_id)
+            if nerr:
+                return nerr
+            data = node.pixelData(x, y, w, h)
+        else:
+            data = doc.pixelData(x, y, w, h)
+
+        image = QImage(bytes(data), w, h, w * 4, QImage.Format_ARGB32).copy()
+        # .copy() detaches from the Python buffer so save/scale can't
+        # outlive the pixelData byte object
+        max_side = params.get("max_side")
+        if max_side:
+            image = image.scaled(int(max_side), int(max_side),
+                                 aspectRatioMode=1, transformationMode=1)
+
+        filename = params.get("filename", f"capture_{int(time.time())}.png")
+        if not filename.endswith(".png"):
+            filename += ".png"
+        filepath = _path_allowed(os.path.join(CANVAS_OUTPUT_DIR, filename))
+        if not filepath:
+            return {"error": "Path outside allowlisted roots"}
+        if not image.save(filepath, "PNG"):
+            return {"error": f"Could not save capture: {filepath}"}
+        return {"status": "ok", "path": filepath, "width": image.width(),
+                "height": image.height(), "revision": int(time.time())}
 
 
 # Register the extension
