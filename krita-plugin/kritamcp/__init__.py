@@ -4,7 +4,8 @@ Allows Claude (or any MCP client) to paint by sending commands to this plugin.
 """
 
 from krita import *
-from PyQt6.QtCore import QTimer, QThread, pyqtSignal, QPointF, QRectF, QByteArray
+from PyQt6.QtCore import (QTimer, QThread, pyqtSignal, QPointF, QRectF,
+                          QByteArray, QUuid, QPoint, Qt)
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import QMessageBox
 import json
@@ -137,7 +138,7 @@ class PaintRequestHandler(BaseHTTPRequestHandler):
                     "new_canvas", "set_color", "set_brush", "stroke",
                     "fill", "draw_shape", "get_canvas", "undo", "redo",
                     "clear", "save", "get_color_at", "list_brushes",
-                    "open_file",
+                    "open_file", "close_document",
                     # v3 native surface (see `capabilities` action)
                     "capabilities", "native_paint_path", "brush_state",
                     "document_state", "layer_list", "layer_create",
@@ -271,6 +272,8 @@ class KritaMCPExtension(Extension):
                 return self.cmd_list_brushes(params)
             elif action == "open_file":
                 return self.cmd_open_file(params)
+            elif action == "close_document":
+                return self.cmd_close_document(params)
             elif action == "capabilities":
                 return self.cmd_capabilities(params)
             elif action == "native_paint_path":
@@ -843,6 +846,18 @@ class KritaMCPExtension(Extension):
 
         return {"status": "ok", "brushes": brush_list, "count": len(brush_list)}
 
+    def cmd_close_document(self, params):
+        """Close a document (default: active). Returns to the previous doc."""
+        doc, err = self._resolve_document(params)
+        if err:
+            return err
+        if not doc:
+            return {"error": "No active document"}
+        name = doc.name()
+        if not doc.close():
+            return {"error": f"Could not close document: {name}"}
+        return {"status": "ok", "closed": name}
+
     def cmd_open_file(self, params):
         """Open an existing file in Krita."""
         filepath = params.get("path")
@@ -876,6 +891,7 @@ class KritaMCPExtension(Extension):
             "plugin": "kritamcp",
             "plugin_version": PLUGIN_VERSION,
             "protocol_version": PROTOCOL_VERSION,
+            "krita_version": Krita.instance().version(),
             "actions": [
                 "native_paint_path", "brush_state", "document_state",
                 "layer_list", "layer_create", "layer_select",
@@ -884,6 +900,7 @@ class KritaMCPExtension(Extension):
                 "commit_transaction", "rollback_transaction",
                 "batch_actions", "capture", "save", "get_color_at",
                 "list_brushes", "open_file", "new_canvas",
+                "close_document",
             ],
             "native_brush_engine": True,
             "per_point_pressure": True,
@@ -919,7 +936,7 @@ class KritaMCPExtension(Extension):
         """Return (node, error). Honours params['node_id'] (node QUuid)."""
         if not node_id:
             return doc.activeNode(), None
-        node = doc.nodeByUniqueID(node_id)
+        node = doc.nodeByUniqueID(QUuid(node_id))
         if node is None:
             return None, {"error": f"Node not found: {node_id}"}
         return node, None
@@ -939,6 +956,32 @@ class KritaMCPExtension(Extension):
             return False
         view.setCurrentBrushPreset(found)
         return True
+
+    # None = probe on first paint; True/False = Krita build's paintLine takes
+    # QPoint (5.2-style bindings, e.g. Krita 6 PyQt6) or QPointF (master).
+    _paint_segment_uses_qpoint = None
+
+    def _paint_segment(self, layer, x1, y1, p1, x2, y2, p2, stroke_style):
+        """One paintLine segment, tolerant to both endpoint-type signatures.
+
+        The probe raises before painting anything, so no stroke is
+        partially drawn by a failed attempt.
+        """
+        if self._paint_segment_uses_qpoint is None:
+            try:
+                layer.paintLine(QPointF(x1, y1), QPointF(x2, y2), p1, p2,
+                                stroke_style)
+                self._paint_segment_uses_qpoint = False
+                return
+            except TypeError:
+                self._paint_segment_uses_qpoint = True
+        if self._paint_segment_uses_qpoint:
+            layer.paintLine(QPoint(int(round(x1)), int(round(y1))),
+                            QPoint(int(round(x2)), int(round(y2))),
+                            p1, p2, stroke_style)
+        else:
+            layer.paintLine(QPointF(x1, y1), QPointF(x2, y2), p1, p2,
+                            stroke_style)
 
     def cmd_native_paint_path(self, params):
         """Pressure-aware path painted by Krita's native brush engine.
@@ -1007,8 +1050,8 @@ class KritaMCPExtension(Extension):
             for i in range(1, len(norm_points)):
                 x1, y1, p1 = norm_points[i - 1]
                 x2, y2, p2 = norm_points[i]
-                layer.paintLine(QPointF(x1, y1), QPointF(x2, y2), p1, p2,
-                                stroke_style)
+                self._paint_segment(layer, x1, y1, p1, x2, y2, p2,
+                                    stroke_style)
             doc.refreshProjection()
             elapsed_ms = int((time.time() - start) * 1000)
         finally:
@@ -1309,7 +1352,7 @@ class KritaMCPExtension(Extension):
             return {"error": "Document for transaction is gone"}
         restored = 0
         for node_id, snap in txn["snapshot"].items():
-            node = doc.nodeByUniqueID(node_id)
+            node = doc.nodeByUniqueID(QUuid(node_id))
             if node is None:
                 continue
             node.setPixelData(QByteArray(snap["data"]), snap["x"], snap["y"],
@@ -1409,13 +1452,14 @@ class KritaMCPExtension(Extension):
         else:
             data = doc.pixelData(x, y, w, h)
 
-        image = QImage(bytes(data), w, h, w * 4, QImage.Format_ARGB32).copy()
+        image = QImage(bytes(data), w, h, w * 4, QImage.Format.Format_ARGB32).copy()
         # .copy() detaches from the Python buffer so save/scale can't
         # outlive the pixelData byte object
         max_side = params.get("max_side")
         if max_side:
             image = image.scaled(int(max_side), int(max_side),
-                                 aspectRatioMode=1, transformationMode=1)
+                                 aspectRatioMode=Qt.AspectRatioMode.KeepAspectRatio,
+                                 transformationMode=Qt.TransformationMode.SmoothTransformation)
 
         filename = params.get("filename", f"capture_{int(time.time())}.png")
         if not filename.endswith(".png"):
