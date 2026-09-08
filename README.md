@@ -22,6 +22,9 @@ Two components:
 MCP Client (Claude, etc.)  ←→  MCP Server (server.py)  ←→  Krita Plugin (HTTP on :5678)  ←→  Krita
 ```
 
+See [docs/API.md](docs/API.md) for the HTTP envelope, legacy actions, v3
+native surface, transaction semantics, and limits.
+
 ## Setup
 
 ### 1. Install the Krita Plugin
