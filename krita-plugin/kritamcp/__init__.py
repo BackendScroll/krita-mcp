@@ -457,8 +457,19 @@ class KritaMCPExtension(Extension):
     def _fill_u16(layer, width: int, height: int, rgba: tuple[int, int, int, int]) -> None:
         red, green, blue, alpha = (channel * 257 for channel in rgba)
         pixel = struct.pack("=HHHH", blue, green, red, alpha)
-        if not layer.setPixelData(QByteArray(pixel * (width * height)), 0, 0, width, height):
-            raise ProtocolError("substrate_failed", "could not initialize the neutral substrate")
+        # Keep the Python/Qt transfer bounded for production canvases. A
+        # 3000-square U16 RGBA substrate is 72 MB and a one-shot QByteArray can
+        # fail inside PyQt/Krita even though the document itself is valid.
+        rows_per_chunk = max(1, min(128, (8 * 1024 * 1024) // (width * len(pixel))))
+        for top in range(0, height, rows_per_chunk):
+            rows = min(rows_per_chunk, height - top)
+            data = QByteArray(pixel * (width * rows))
+            if not layer.setPixelData(data, 0, top, width, rows):
+                raise ProtocolError(
+                    "substrate_failed",
+                    "could not initialize the neutral substrate",
+                    details={"top": top, "rows": rows},
+                )
 
     def _create_document(self, params: dict, _envelope: dict) -> dict:
         width, height = self._validate_canvas_size(params.get("width"), params.get("height"))
