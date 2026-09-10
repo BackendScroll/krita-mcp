@@ -1,1477 +1,1114 @@
-"""
-Krita MCP Bridge - HTTP server for external paint commands in Krita
-Allows Claude (or any MCP client) to paint by sending commands to this plugin.
+"""Authenticated protocol-v4 HTTP bridge for Krita 6.
+
+The HTTP thread validates and queues envelopes.  Every Krita API call runs on
+the Qt main thread.  Protocol-v4 is intentionally a clean break: no legacy
+action aliases or pixel-raster stroke fallbacks are registered.
 """
 
-from krita import *
-from PyQt6.QtCore import (QTimer, QThread, pyqtSignal, QPointF, QRectF,
-                          QByteArray, QUuid, QPoint, Qt)
-from PyQt6.QtGui import QColor
-from PyQt6.QtWidgets import QMessageBox
+from __future__ import annotations
+
+import hashlib
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
-import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs
 import os
+from pathlib import Path
+import struct
+import tempfile
+import threading
 import time
 import uuid
 
-from PyQt6.QtGui import QImage
+from krita import Extension, InfoObject, Krita, ManagedColor, Selection
+from PyQt6.QtCore import QByteArray, QPointF, QRect, Qt, QThread, QTimer, QUuid
+from PyQt6.QtGui import QColor, QColorSpace, QImage, QPainterPath
 
-# Configuration - customize these as needed
-SERVER_PORT = 5678
-CANVAS_OUTPUT_DIR = os.path.expanduser("~/krita-mcp-output")
-
-# v3 protocol constants. Bump PROTOCOL_VERSION when the contract changes;
-# clients must negotiate via the `capabilities` action instead of guessing.
-PROTOCOL_VERSION = 3
-PLUGIN_VERSION = "v3-native"
-
-MAX_PATH_POINTS = 512
-MAX_BATCH_ACTIONS = 128
-MAX_CROP_PIXELS = 16 * 1024 * 1024  # 64 MiB raw RGBA; includes a 4096² crop
-MAX_TRANSACTION_BYTES = 512 * 1024 * 1024  # snapshot memory guard
-STRUCTURAL_ACTIONS = {
-    "layer_create", "layer_delete", "layer_duplicate",
-    "layer_merge_down", "batch_actions", "new_canvas",
-}
-
-# Filesystem writes (save/export/capture) are restricted to these roots.
-# Extra roots can be added via KRITA_MCP_ALLOWED_ROOTS (colon-separated).
-def _allowed_roots():
-    roots = [CANVAS_OUTPUT_DIR]
-    extra = os.environ.get("KRITA_MCP_ALLOWED_ROOTS", "")
-    roots.extend(os.path.expanduser(p) for p in extra.split(":") if p)
-    return [os.path.realpath(r) for r in roots]
-
-ALLOWED_ROOTS = _allowed_roots()
+from .protocol_v4 import (
+    ACTIONS,
+    MAX_BODY_BYTES,
+    MAX_QUEUE_DEPTH,
+    MAX_TRACED_STROKES,
+    MAX_UNTRACED_STROKES,
+    PLUGIN_VERSION,
+    PROTOCOL_VERSION,
+    PathGuard,
+    ProtocolError,
+    ProtocolState,
+    brush_fingerprint,
+    ensure_token,
+    error_response,
+    parse_json_body,
+    validate_strokes,
+)
 
 
-def _path_allowed(filepath):
-    """Reject writes outside the allowlisted roots (no traversal, no symlinks)."""
-    real = os.path.realpath(os.path.abspath(filepath))
-    for root in ALLOWED_ROOTS:
-        if real == root or real.startswith(root + os.sep):
-            return real
-    return None
+SERVER_HOST = "127.0.0.1"
+SERVER_PORT = int(os.environ.get("KRITA_MCP_PORT", "5678"))
+COLOR_MODEL = "RGBA"
+COLOR_DEPTH = "U16"
+COLOR_PROFILE = "sRGB-elle-V2-srgbtrc.icc"
+RESOLUTION_PPI = 300.0
+MAX_CAPTURE_PIXELS = 16 * 1024 * 1024
+TRANSACTION_PREFIX = "__krita_mcp_v4_candidate__"
+
+_runtime_base = os.environ.get("XDG_RUNTIME_DIR")
+if not _runtime_base:
+    _runtime_base = os.path.join(tempfile.gettempdir(), f"runtime-{os.getuid()}")
+TOKEN_PATH = Path(_runtime_base) / "krita-mcp" / "token"
+ASSET_ROOT = Path(
+    os.environ.get(
+        "KRITA_MCP_ASSET_ROOT",
+        str(Path.home() / "Development" / "Workspaces" / "creation"),
+    )
+).expanduser()
+TRACE_ROOT = Path(
+    os.environ.get(
+        "KRITA_MCP_TRACE_ROOT", str(Path(tempfile.gettempdir()) / "krita-mcp-traces")
+    )
+).expanduser()
+TRACE_ROOT.mkdir(parents=True, exist_ok=True)
+
+TOKEN = ensure_token(TOKEN_PATH)
+PATH_GUARD = PathGuard([ASSET_ROOT, TRACE_ROOT], [ASSET_ROOT, TRACE_ROOT])
+PROTOCOL_STATE = ProtocolState(TOKEN)
 
 
-def _hex_rgb(hx):
-    hx = hx.lstrip("#")
-    return (int(hx[0:2], 16), int(hx[2:4], 16), int(hx[4:6], 16))
+def _capabilities() -> dict:
+    return {
+        "protocol_version": PROTOCOL_VERSION,
+        "plugin_version": PLUGIN_VERSION,
+        "actions": sorted(ACTIONS),
+        "document": {
+            "color_model": COLOR_MODEL,
+            "color_depth": COLOR_DEPTH,
+            "color_profile": COLOR_PROFILE,
+            "resolution_ppi": RESOLUTION_PPI,
+        },
+        "geometry": ["line", "cubic"],
+        "line_pressure": True,
+        "cubic_pressure": False,
+        "unsupported_sensors": ["rotation", "speed", "tilt"],
+        "transactions": "ephemeral_candidate_layer",
+        "captures": "png_path",
+        "limits": {
+            "max_body_bytes": MAX_BODY_BYTES,
+            "max_queue_depth": MAX_QUEUE_DEPTH,
+            "max_traced_strokes": MAX_TRACED_STROKES,
+            "max_untraced_strokes": MAX_UNTRACED_STROKES,
+            "max_capture_pixels": MAX_CAPTURE_PIXELS,
+        },
+    }
 
-
-def _clamp(v, lo, hi):
-    return max(lo, min(hi, v))
 
 class CommandQueue:
-    """Thread-safe command queue for passing commands from HTTP thread to main thread."""
-    def __init__(self):
-        self.queue = []
-        self.results = {}
-        self.lock = threading.Lock()
-        self.result_event = threading.Event()
+    """Bounded request queue linking HTTP workers to Krita's main thread."""
 
-    def push(self, command_id, command):
-        with self.lock:
-            self.queue.append((command_id, command))
+    def __init__(self) -> None:
+        self._pending: list[tuple[str, dict]] = []
+        self._results: dict[str, tuple[threading.Event, dict | None]] = {}
+        self._lock = threading.Lock()
 
-    def pop(self):
-        with self.lock:
-            if self.queue:
-                return self.queue.pop(0)
-            return None
+    def push(self, envelope: dict) -> str:
+        queue_id = str(uuid.uuid4())
+        with self._lock:
+            if len(self._pending) >= MAX_QUEUE_DEPTH:
+                raise ProtocolError(
+                    "queue_full",
+                    "the Krita command queue is full",
+                    retryable=True,
+                    http_status=503,
+                )
+            self._results[queue_id] = (threading.Event(), None)
+            self._pending.append((queue_id, envelope))
+        return queue_id
 
-    def set_result(self, command_id, result):
-        with self.lock:
-            self.results[command_id] = result
-        self.result_event.set()
+    def pop(self) -> tuple[str, dict] | None:
+        with self._lock:
+            return self._pending.pop(0) if self._pending else None
 
-    def get_result(self, command_id, timeout=120):
-        """Wait for result with timeout.
+    def set_result(self, queue_id: str, value: dict) -> None:
+        with self._lock:
+            item = self._results.get(queue_id)
+            if item is None:
+                return
+            event, _ = item
+            self._results[queue_id] = (event, value)
+            event.set()
 
-        The default timeout of 120s is important — canvas export and save
-        operations can take a long time on large canvases. The original 30s
-        default caused frequent timeouts. The MCP server's send_command()
-        timeout must match or exceed this value.
-        """
-        start = threading.Event()
-        for _ in range(int(timeout * 10)):  # Check every 100ms
-            with self.lock:
-                if command_id in self.results:
-                    result = self.results.pop(command_id)
-                    return result
-            self.result_event.wait(0.1)
-            self.result_event.clear()
-        return {"error": "Timeout waiting for command execution"}
+    def get_result(self, queue_id: str, timeout: float = 180.0) -> dict:
+        with self._lock:
+            item = self._results.get(queue_id)
+        if item is None:
+            raise ProtocolError("internal_error", "queued command disappeared", http_status=500)
+        event, _ = item
+        if not event.wait(timeout):
+            with self._lock:
+                self._results.pop(queue_id, None)
+            raise ProtocolError(
+                "command_timeout",
+                "Krita did not finish the command before the bridge timeout",
+                retryable=True,
+                http_status=504,
+            )
+        with self._lock:
+            _, result = self._results.pop(queue_id)
+        if result is None:
+            raise ProtocolError("internal_error", "command completed without a result", http_status=500)
+        return result
 
-# Global command queue
-command_queue = CommandQueue()
-command_counter = 0
 
-class PaintRequestHandler(BaseHTTPRequestHandler):
-    """HTTP request handler for paint commands."""
+COMMAND_QUEUE = CommandQueue()
 
-    def log_message(self, format, *args):
-        # Suppress HTTP logging
-        pass
 
-    def send_json_response(self, data, status=200):
+class _LoopbackHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+class V4RequestHandler(BaseHTTPRequestHandler):
+    """Strict HTTP surface: /health plus authenticated /v4 endpoints."""
+
+    server_version = "krita-mcp-v4"
+    sys_version = ""
+
+    def log_message(self, _format, *_args) -> None:
+        return
+
+    def _send(self, value: dict, status: int = 200) -> None:
+        body = json.dumps(value, separators=(",", ":")).encode("utf-8")
         self.send_response(status)
-        self.send_header('Content-Type', 'application/json')
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
-        self.wfile.write(json.dumps(data).encode())
+        self.wfile.write(body)
 
-    def do_GET(self):
-        """Handle GET requests - mainly for health check."""
-        parsed = urlparse(self.path)
+    def _fail(self, error: ProtocolError, request_id: str | None = None) -> None:
+        self._send(error_response(request_id, error), error.http_status)
 
-        if parsed.path == '/health':
-            self.send_json_response({"status": "ok", "plugin": "kritamcp",
-                                    "version": PLUGIN_VERSION})
-        elif parsed.path == '/info':
-            self.send_json_response({
-                "status": "ok",
-                "canvas_dir": CANVAS_OUTPUT_DIR,
-                "commands": [
-                    # legacy (v2) surface — kept for compatibility
-                    "new_canvas", "set_color", "set_brush", "stroke",
-                    "fill", "draw_shape", "get_canvas", "undo", "redo",
-                    "clear", "save", "get_color_at", "list_brushes",
-                    "open_file", "close_document",
-                    # v3 native surface (see `capabilities` action)
-                    "capabilities", "native_paint_path", "brush_state",
-                    "document_state", "layer_list", "layer_create",
-                    "layer_select", "layer_update", "layer_delete",
-                    "layer_duplicate", "layer_merge_down",
-                    "begin_transaction", "commit_transaction",
-                    "rollback_transaction", "batch_actions", "capture",
-                ]
-            })
-        else:
-            self.send_json_response({"error": "Unknown endpoint"}, 404)
+    def _authenticate(self) -> None:
+        PROTOCOL_STATE.authenticate(self.headers.get("Authorization"))
 
-    def do_POST(self):
-        """Handle POST requests - paint commands."""
-        global command_counter
-
-        content_length = int(self.headers.get('Content-Length', 0))
-        body = self.rfile.read(content_length).decode('utf-8')
-
-        try:
-            command = json.loads(body)
-        except json.JSONDecodeError:
-            self.send_json_response({"error": "Invalid JSON"}, 400)
+    def do_GET(self) -> None:
+        if self.path == "/health":
+            self._send({"status": "ok"})
             return
+        try:
+            if self.path != "/v4/capabilities":
+                raise ProtocolError(
+                    "protocol_mismatch",
+                    "use authenticated /v4/capabilities or /v4/command",
+                    http_status=426,
+                )
+            self._authenticate()
+            self._send(
+                {
+                    "ok": True,
+                    "request_id": self.headers.get("X-Request-ID"),
+                    "document_revision": PROTOCOL_STATE.revision,
+                    "result": _capabilities(),
+                    "warnings": [],
+                }
+            )
+        except ProtocolError as error:
+            self._fail(error)
 
-        # Assign command ID and queue it
-        command_counter += 1
-        command_id = command_counter
-        command_queue.push(command_id, command)
-
-        # Wait for result from main thread
-        result = command_queue.get_result(command_id)
-
-        if "error" in result:
-            self.send_json_response(result, 500)
-        else:
-            self.send_json_response(result)
+    def do_POST(self) -> None:
+        request_id = None
+        try:
+            if self.path != "/v4/command":
+                raise ProtocolError(
+                    "protocol_mismatch",
+                    "only /v4/command accepts command envelopes",
+                    http_status=426,
+                )
+            self._authenticate()
+            raw_length = self.headers.get("Content-Length")
+            if raw_length is None:
+                raise ProtocolError("length_required", "Content-Length is required", http_status=411)
+            try:
+                content_length = int(raw_length)
+            except ValueError as exc:
+                raise ProtocolError("invalid_length", "Content-Length must be an integer") from exc
+            if content_length < 0 or content_length > MAX_BODY_BYTES:
+                raise ProtocolError(
+                    "body_too_large",
+                    f"request body exceeds {MAX_BODY_BYTES} bytes",
+                    http_status=413,
+                )
+            envelope = parse_json_body(self.rfile.read(content_length), content_length)
+            request_id = envelope["request_id"]
+            queue_id = COMMAND_QUEUE.push(envelope)
+            self._send(COMMAND_QUEUE.get_result(queue_id))
+        except ProtocolError as error:
+            self._fail(error, request_id)
 
 
 class ServerThread(QThread):
-    """Thread to run HTTP server without blocking Krita UI."""
-
-    def __init__(self, port):
+    def __init__(self, port: int) -> None:
         super().__init__()
         self.port = port
-        self.server = None
+        self.server: _LoopbackHTTPServer | None = None
 
-    def run(self):
-        self.server = HTTPServer(('localhost', self.port), PaintRequestHandler)
-        self.server.serve_forever()
+    def run(self) -> None:
+        self.server = _LoopbackHTTPServer((SERVER_HOST, self.port), V4RequestHandler)
+        self.server.serve_forever(poll_interval=0.25)
 
-    def stop(self):
-        if self.server:
+    def stop(self) -> None:
+        if self.server is not None:
             self.server.shutdown()
+            self.server.server_close()
 
 
 class KritaMCPExtension(Extension):
-    """Main Krita extension class."""
+    """Main-thread implementation of the protocol-v4 actions."""
 
-    def __init__(self, parent):
+    def __init__(self, parent) -> None:
         super().__init__(parent)
-        self.server_thread = None
-        self.timer = None
-        self.current_brush_size = 20
-        self.current_opacity = 1.0
-        # v3: transaction_id -> {node_id: {x, y, w, h, data}} pixel snapshots
-        self.transactions = {}
+        self.server_thread: ServerThread | None = None
+        self.timer: QTimer | None = None
+        self._documents: dict[str, object] = {}
+        self._document_ids: dict[int, str] = {}
+        self._brushes: dict[str, object] = {}
 
-    def setup(self):
-        """Called when extension is loaded."""
-        pass
+    def setup(self) -> None:
+        return
 
-    def createActions(self, window):
-        """Called when a new window is created."""
-        # Ensure output directory exists
-        os.makedirs(CANVAS_OUTPUT_DIR, exist_ok=True)
-
-        # Start HTTP server
+    def createActions(self, _window) -> None:
         if self.server_thread is None:
             self.server_thread = ServerThread(SERVER_PORT)
             self.server_thread.start()
-            print(f"[KritaMCP] HTTP server started on port {SERVER_PORT}")
-
-        # Start timer to process command queue
+            print(f"[KritaMCP] protocol v4 listening on {SERVER_HOST}:{SERVER_PORT}")
         if self.timer is None:
             self.timer = QTimer()
             self.timer.timeout.connect(self.process_commands)
-            self.timer.start(50)  # Check every 50ms
+            self.timer.start(20)
 
-    def process_commands(self):
-        """Process commands from queue in main thread."""
-        item = command_queue.pop()
+    def process_commands(self) -> None:
+        item = COMMAND_QUEUE.pop()
         if item is None:
             return
+        queue_id, envelope = item
+        COMMAND_QUEUE.set_result(queue_id, self.execute_envelope(envelope))
 
-        command_id, command = item
-        result = self.execute_command(command)
-        command_queue.set_result(command_id, result)
-
-    def execute_command(self, command):
-        """Execute a paint command and return result."""
+    def execute_envelope(self, envelope: dict) -> dict:
+        request_id = envelope.get("request_id")
         try:
-            action = command.get("action")
-            params = command.get("params", {})
-
-            if action == "new_canvas":
-                return self.cmd_new_canvas(params)
-            elif action == "set_color":
-                return self.cmd_set_color(params)
-            elif action == "set_brush":
-                return self.cmd_set_brush(params)
-            elif action == "stroke":
-                return self.cmd_stroke(params)
-            elif action == "fill":
-                return self.cmd_fill(params)
-            elif action == "draw_shape":
-                return self.cmd_draw_shape(params)
-            elif action == "get_canvas":
-                return self.cmd_get_canvas(params)
-            elif action == "undo":
-                return self.cmd_undo(params)
-            elif action == "redo":
-                return self.cmd_redo(params)
-            elif action == "clear":
-                return self.cmd_clear(params)
-            elif action == "save":
-                return self.cmd_save(params)
-            elif action == "get_color_at":
-                return self.cmd_get_color_at(params)
-            elif action == "list_brushes":
-                return self.cmd_list_brushes(params)
-            elif action == "open_file":
-                return self.cmd_open_file(params)
-            elif action == "close_document":
-                return self.cmd_close_document(params)
-            elif action == "capabilities":
-                return self.cmd_capabilities(params)
-            elif action == "native_paint_path":
-                return self.cmd_native_paint_path(params)
-            elif action == "brush_state":
-                return self.cmd_brush_state(params)
-            elif action == "document_state":
-                return self.cmd_document_state(params)
-            elif action == "layer_list":
-                return self.cmd_layer_list(params)
-            elif action == "layer_create":
-                return self.cmd_layer_create(params)
-            elif action == "layer_select":
-                return self.cmd_layer_select(params)
-            elif action == "layer_update":
-                return self.cmd_layer_update(params)
-            elif action == "layer_delete":
-                return self.cmd_layer_delete(params)
-            elif action == "layer_duplicate":
-                return self.cmd_layer_duplicate(params)
-            elif action == "layer_merge_down":
-                return self.cmd_layer_merge_down(params)
-            elif action == "begin_transaction":
-                return self.cmd_begin_transaction(params)
-            elif action == "commit_transaction":
-                return self.cmd_commit_transaction(params)
-            elif action == "rollback_transaction":
-                return self.cmd_rollback_transaction(params)
-            elif action == "batch_actions":
-                return self.cmd_batch_actions(params)
-            elif action == "capture":
-                return self.cmd_capture(params)
-            else:
-                return {"error": f"Unknown action: {action}"}
-
-        except Exception as e:
-            return {"error": str(e)}
-
-    def get_active_document(self):
-        """Get active document or return None."""
-        app = Krita.instance()
-        return app.activeDocument()
-
-    def get_active_view(self):
-        """Get active view or return None."""
-        app = Krita.instance()
-        window = app.activeWindow()
-        if window:
-            return window.activeView()
-        return None
-
-    def get_active_layer(self):
-        """Get active paint layer."""
-        doc = self.get_active_document()
-        if doc:
-            return doc.activeNode()
-        return None
-
-    def cmd_new_canvas(self, params):
-        """Create a new canvas."""
-        width = params.get("width", 800)
-        height = params.get("height", 600)
-        name = params.get("name", "New Canvas")
-        bg_color = params.get("background", "#1a1a2e")
-
-        app = Krita.instance()
-
-        # Create document with background color
-        doc = app.createDocument(width, height, name, "RGBA", "U8", "", 120.0)
-
-        window = app.activeWindow()
-        if window:
-            window.addView(doc)
-
-        # Create a paint layer
-        root = doc.rootNode()
-        layer = doc.createNode("paint", "paintlayer")
-        root.addChildNode(layer, None)
-
-        # Fill background using pixel data
-        color = QColor(bg_color)
-        r, g, b = color.red(), color.green(), color.blue()
-
-        # Create pixel data for entire canvas (BGRA format)
-        pixel_data = bytes([b, g, r, 255] * (width * height))
-        layer.setPixelData(pixel_data, 0, 0, width, height)
-
-        doc.refreshProjection()
-
-        return {"status": "ok", "width": width, "height": height, "name": name}
-
-    def cmd_set_color(self, params):
-        """Set foreground color."""
-        color_hex = params.get("color", "#ffffff")
-
-        view = self.get_active_view()
-        if not view:
-            return {"error": "No active view"}
-
-        color = QColor(color_hex)
-        mc = ManagedColor.fromQColor(color, view.canvas())
-        view.setForeGroundColor(mc)
-
-        return {"status": "ok", "color": color_hex}
-
-    def cmd_set_brush(self, params):
-        """Set brush preset and size."""
-        preset_name = params.get("preset", None)
-        size = params.get("size", None)
-        opacity = params.get("opacity", None)
-
-        view = self.get_active_view()
-        if not view:
-            return {"error": "No active view"}
-
-        if preset_name:
-            # Find brush preset
-            presets = Krita.instance().resources("preset")
-            found = None
-            for name, preset in presets.items():
-                if preset_name.lower() in name.lower():
-                    found = preset
-                    break
-            if found:
-                view.setCurrentBrushPreset(found)
-            else:
-                return {"error": f"Brush preset not found: {preset_name}"}
-
-        if size is not None:
-            self.current_brush_size = size
-            view.setBrushSize(size)
-
-        if opacity is not None:
-            self.current_opacity = opacity
-            # Opacity is set per-stroke, store for later
-
-        return {"status": "ok", "preset": preset_name, "size": size, "opacity": opacity}
-
-    def cmd_stroke(self, params):
-        """Paint a stroke along points using pixel-level drawing with soft edges."""
-        points = params.get("points", [])
-        brush_size = params.get("size", self.current_brush_size)
-        hardness = params.get("hardness", 0.5)  # 0.0 = very soft, 1.0 = hard edge
-        opacity = params.get("opacity", 1.0)
-        colors_in = params.get("colors") or []
-        taper_in = params.get("taper") or []
-        grain = max(0.0, min(1.0, float(params.get("grain", 0.0) or 0.0)))
-
-        if len(points) < 2:
-            return {"error": "Need at least 2 points for a stroke"}
-
-        layer = self.get_active_layer()
-        if not layer:
-            return {"error": "No active layer"}
-
-        doc = self.get_active_document()
-        view = self.get_active_view()
-
-        if not view:
-            return {"error": "No active view"}
-
-        # Get current foreground color
-        fg = view.foregroundColor()
-        qcolor = fg.colorForCanvas(view.canvas())
-        r, g, b = qcolor.red(), qcolor.green(), qcolor.blue()
-
-        def hex_rgb(hx):
-            hx = hx.lstrip("#")
-            return (int(hx[0:2], 16), int(hx[2:4], 16), int(hx[4:6], 16))
-
-        point_colors = None
-        if len(colors_in) == len(points):
-            try:
-                point_colors = [hex_rgb(c) for c in colors_in]
-            except Exception:
-                point_colors = None
-        point_tapers = None
-        if len(taper_in) == len(points):
-            try:
-                point_tapers = [max(0.05, float(t)) for t in taper_in]
-            except Exception:
-                point_tapers = None
-
-        import math
-        import random
-        rng = random.Random(4242)
-
-        def point_radius(i):
-            t = point_tapers[i] if point_tapers else 1.0
-            return max(1, int(round(brush_size * t / 2.0)))
-
-        max_radius = max(point_radius(i) for i in range(len(points)))
-
-        width = doc.width()
-        height = doc.height()
-
-        # Calculate bounding box for all points plus max brush radius
-        min_x = max(0, int(min(p[0] for p in points)) - max_radius - 2)
-        min_y = max(0, int(min(p[1] for p in points)) - max_radius - 2)
-        max_x = min(width, int(max(p[0] for p in points)) + max_radius + 2)
-        max_y = min(height, int(max(p[1] for p in points)) + max_radius + 2)
-
-        w = max_x - min_x
-        h = max_y - min_y
-
-        if w <= 0 or h <= 0:
-            return {"error": "Stroke out of bounds"}
-
-        # Get existing pixel data for the affected region
-        existing = layer.pixelData(min_x, min_y, w, h)
-        pixels = bytearray(existing)
-
-        import math
-
-        def falloff(dist, radius):
-            if radius <= 0:
-                return 0.0
-            d = dist / radius
-            if hardness >= 1.0:
-                return 1.0
-            if d < hardness:
-                return 1.0
-            fall = (d - hardness) / (1.0 - hardness)
-            return max(0.0, 1.0 - fall)
-
-        def stamp(cx, cy, radius, col):
-            """One soft stamp with optional grain, blending onto the layer."""
-            for dy in range(-radius, radius + 1):
-                for dx in range(-radius, radius + 1):
-                    dist_sq = dx*dx + dy*dy
-                    if dist_sq > radius*radius:
-                        continue
-                    px = int(cx) + dx - min_x
-                    py = int(cy) + dy - min_y
-                    if not (0 <= px < w and 0 <= py < h):
-                        continue
-                    af = falloff(math.sqrt(dist_sq), radius)
-                    a = int(255 * af * opacity)
-                    if a <= 0:
-                        continue
-                    idx = (py * w + px) * 4
-                    er, eg, eb = pixels[idx+2], pixels[idx+1], pixels[idx]
-                    cr, cg, cb = col
-                    if grain > 0.0:
-                        n = 1.0 + rng.uniform(-grain, grain)
-                        cr = min(255, max(0, int(cr * n)))
-                        cg = min(255, max(0, int(cg * n)))
-                        cb = min(255, max(0, int(cb * n)))
-                    blend = a / 255.0
-                    pixels[idx]   = int(eb * (1 - blend) + cb * blend)
-                    pixels[idx+1] = int(eg * (1 - blend) + cg * blend)
-                    pixels[idx+2] = int(er * (1 - blend) + cr * blend)
-                    pixels[idx+3] = max(pixels[idx+3], a)
-
-        def stamp_segment(i, j):
-            x1, y1 = points[i]
-            x2, y2 = points[j]
-            r1, r2 = point_radius(i), point_radius(j)
-            c1 = point_colors[i] if point_colors else (r, g, b)
-            c2 = point_colors[j] if point_colors else (r, g, b)
-            dist = math.hypot(x2 - x1, y2 - y1)
-            steps = max(1, int(dist / max(1, min(r1, r2) / 3.0)))
-            for k in range(steps + 1):
-                t = k / steps
-                cx = x1 + (x2 - x1) * t
-                cy = y1 + (y2 - y1) * t
-                rad = max(1, int(round(r1 + (r2 - r1) * t)))
-                col = (int(c1[0] + (c2[0] - c1[0]) * t),
-                       int(c1[1] + (c2[1] - c1[1]) * t),
-                       int(c1[2] + (c2[2] - c1[2]) * t))
-                stamp(cx, cy, rad, col)
-
-        for i in range(len(points)):
-            stamp(points[i][0], points[i][1], point_radius(i),
-                  point_colors[i] if point_colors else (r, g, b))
-            if i > 0:
-                stamp_segment(i - 1, i)
-
-        layer.setPixelData(bytes(pixels), min_x, min_y, w, h)
-        doc.refreshProjection()
-
-        return {"status": "ok", "points_count": len(points), "hardness": hardness,
-                "colors": point_colors is not None, "taper": point_tapers is not None,
-                "grain": grain}
-
-    def cmd_fill(self, params):
-        """Fill a circular area with current color."""
-        x = params.get("x", 0)
-        y = params.get("y", 0)
-        radius = params.get("radius", 50)
-
-        layer = self.get_active_layer()
-        if not layer:
-            return {"error": "No active layer"}
-
-        doc = self.get_active_document()
-        view = self.get_active_view()
-
-        if not view:
-            return {"error": "No active view"}
-
-        # Get current foreground color
-        fg = view.foregroundColor()
-        qcolor = fg.colorForCanvas(view.canvas())
-        r, g, b = qcolor.red(), qcolor.green(), qcolor.blue()
-
-        # Paint a filled circle using pixel data
-        # Create a bounding box
-        x1 = max(0, x - radius)
-        y1 = max(0, y - radius)
-        x2 = min(doc.width(), x + radius)
-        y2 = min(doc.height(), y + radius)
-        w = x2 - x1
-        h = y2 - y1
-
-        if w <= 0 or h <= 0:
-            return {"error": "Fill area out of bounds"}
-
-        # Get existing pixel data
-        existing = layer.pixelData(x1, y1, w, h)
-        pixels = bytearray(existing)
-
-        # Draw circle
-        for py in range(h):
-            for px in range(w):
-                # Check if point is in circle
-                dx = (x1 + px) - x
-                dy = (y1 + py) - y
-                if dx*dx + dy*dy <= radius*radius:
-                    idx = (py * w + px) * 4
-                    pixels[idx] = b      # B
-                    pixels[idx+1] = g    # G
-                    pixels[idx+2] = r    # R
-                    pixels[idx+3] = 255  # A
-
-        layer.setPixelData(bytes(pixels), x1, y1, w, h)
-        doc.refreshProjection()
-
-        return {"status": "ok", "x": x, "y": y, "radius": radius}
-
-    def cmd_draw_shape(self, params):
-        """Draw a shape (rectangle, ellipse, line)."""
-        shape = params.get("shape", "rectangle")
-        x = params.get("x", 0)
-        y = params.get("y", 0)
-        width = params.get("width", 100)
-        height = params.get("height", 100)
-        fill = params.get("fill", True)
-
-        layer = self.get_active_layer()
-        if not layer:
-            return {"error": "No active layer"}
-
-        doc = self.get_active_document()
-        view = self.get_active_view()
-
-        if not view:
-            return {"error": "No active view"}
-
-        # Get current foreground color
-        fg = view.foregroundColor()
-        qcolor = fg.colorForCanvas(view.canvas())
-        r, g, b = qcolor.red(), qcolor.green(), qcolor.blue()
-
-        if shape == "line":
-            # Draw line using pixel data
-            x2 = params.get("x2", x + width)
-            y2 = params.get("y2", y + height)
-            line_width = params.get("line_width", 2)
-
-            # Calculate bounding box
-            x1_bound = max(0, int(min(x, x2)) - line_width)
-            y1_bound = max(0, int(min(y, y2)) - line_width)
-            x2_bound = min(doc.width(), int(max(x, x2)) + line_width)
-            y2_bound = min(doc.height(), int(max(y, y2)) + line_width)
-            w = x2_bound - x1_bound
-            h = y2_bound - y1_bound
-
-            if w > 0 and h > 0:
-                existing = layer.pixelData(x1_bound, y1_bound, w, h)
-                pixels = bytearray(existing)
-
-                # Draw line with thickness
-                dist = max(abs(x2 - x), abs(y2 - y))
-                steps = max(1, int(dist))
-                radius = max(1, line_width // 2)
-
-                for i in range(steps + 1):
-                    t = i / steps if steps > 0 else 0
-                    cx = x + t * (x2 - x)
-                    cy = y + t * (y2 - y)
-                    for dy in range(-radius, radius + 1):
-                        for dx in range(-radius, radius + 1):
-                            if dx*dx + dy*dy <= radius*radius:
-                                px = int(cx) + dx - x1_bound
-                                py = int(cy) + dy - y1_bound
-                                if 0 <= px < w and 0 <= py < h:
-                                    idx = (py * w + px) * 4
-                                    pixels[idx] = b
-                                    pixels[idx+1] = g
-                                    pixels[idx+2] = r
-                                    pixels[idx+3] = 255
-
-                layer.setPixelData(bytes(pixels), x1_bound, y1_bound, w, h)
-        elif shape == "rectangle" and fill:
-            # Draw filled rectangle using pixel data
-            x1 = max(0, int(x))
-            y1 = max(0, int(y))
-            x2 = min(doc.width(), int(x + width))
-            y2 = min(doc.height(), int(y + height))
-            w = x2 - x1
-            h = y2 - y1
-
-            if w > 0 and h > 0:
-                pixel_data = bytes([b, g, r, 255] * (w * h))
-                layer.setPixelData(pixel_data, x1, y1, w, h)
-        elif shape == "ellipse" and fill:
-            # Draw filled ellipse using pixel data
-            cx = x + width / 2
-            cy = y + height / 2
-            rx = width / 2
-            ry = height / 2
-
-            x1 = max(0, int(x))
-            y1 = max(0, int(y))
-            x2 = min(doc.width(), int(x + width))
-            y2 = min(doc.height(), int(y + height))
-            w = x2 - x1
-            h = y2 - y1
-
-            if w > 0 and h > 0:
-                existing = layer.pixelData(x1, y1, w, h)
-                pixels = bytearray(existing)
-
-                for py in range(h):
-                    for px in range(w):
-                        # Check if point is in ellipse
-                        dx = (x1 + px - cx) / rx if rx > 0 else 0
-                        dy = (y1 + py - cy) / ry if ry > 0 else 0
-                        if dx*dx + dy*dy <= 1:
-                            idx = (py * w + px) * 4
-                            pixels[idx] = b
-                            pixels[idx+1] = g
-                            pixels[idx+2] = r
-                            pixels[idx+3] = 255
-
-                layer.setPixelData(bytes(pixels), x1, y1, w, h)
-        else:
-            return {"error": f"Shape '{shape}' with current options not supported"}
-
-        doc.refreshProjection()
-
-        return {"status": "ok", "shape": shape}
-
-    def cmd_get_canvas(self, params):
-        """Export current canvas to file and return path."""
-        filename = params.get("filename", "canvas.png")
-
-        doc = self.get_active_document()
-        if not doc:
-            return {"error": "No active document"}
-
-        # Ensure filename has extension
-        if not filename.endswith('.png'):
-            filename += '.png'
-
-        filepath = os.path.join(CANVAS_OUTPUT_DIR, filename)
-
-        # Export image (batch mode suppresses export dialog)
-        doc.setBatchmode(True)
-        doc.exportImage(filepath, InfoObject())
-        doc.setBatchmode(False)
-
-        return {"status": "ok", "path": filepath}
-
-    def cmd_undo(self, params):
-        """Undo last action."""
-        app = Krita.instance()
-        action = app.action('edit_undo')
-        if action:
-            action.trigger()
-            return {"status": "ok"}
-        return {"error": "Could not trigger undo"}
-
-    def cmd_redo(self, params):
-        """Redo last undone action."""
-        app = Krita.instance()
-        action = app.action('edit_redo')
-        if action:
-            action.trigger()
-            return {"status": "ok"}
-        return {"error": "Could not trigger redo"}
-
-    def cmd_clear(self, params):
-        """Clear the canvas."""
-        layer = self.get_active_layer()
-        if not layer:
-            return {"error": "No active layer"}
-
-        doc = self.get_active_document()
-
-        # Get canvas dimensions
-        width = doc.width()
-        height = doc.height()
-
-        # Clear by filling with background color
-        bg_color = params.get("color", "#1a1a2e")
-        color = QColor(bg_color)
-        r, g, b = color.red(), color.green(), color.blue()
-
-        # Fill entire layer with color
-        pixel_data = bytes([b, g, r, 255] * (width * height))
-        layer.setPixelData(pixel_data, 0, 0, width, height)
-
-        doc.refreshProjection()
-
-        return {"status": "ok", "color": bg_color}
-
-    def cmd_save(self, params):
-        """Save to specific path."""
-        filepath = params.get("path")
-        if not filepath:
-            return {"error": "No path specified"}
-
-        doc = self.get_active_document()
-        if not doc:
-            return {"error": "No active document"}
-
-        # Batch mode suppresses export dialog
-        doc.setBatchmode(True)
-        doc.exportImage(filepath, InfoObject())
-        doc.setBatchmode(False)
-
-        return {"status": "ok", "path": filepath}
-
-    def cmd_get_color_at(self, params):
-        """Get color at specific pixel (eyedropper)."""
-        x = params.get("x", 0)
-        y = params.get("y", 0)
-
-        doc = self.get_active_document()
-        if not doc:
-            return {"error": "No active document"}
-
-        # Get projection pixel data at point
-        layer = doc.rootNode()
-        pixel_data = layer.projectionPixelData(x, y, 1, 1)
-
-        if len(pixel_data) >= 4:
-            # RGBA
-            b, g, r, a = pixel_data[0], pixel_data[1], pixel_data[2], pixel_data[3]
-            hex_color = "#{:02x}{:02x}{:02x}".format(r, g, b)
-            return {"status": "ok", "color": hex_color, "r": r, "g": g, "b": b, "a": a}
-
-        return {"error": "Could not read pixel"}
-
-    def cmd_list_brushes(self, params):
-        """List available brush presets."""
-        filter_str = params.get("filter", "")
-        limit = params.get("limit", 50)
-
-        presets = Krita.instance().resources("preset")
-        brush_list = []
-
-        for name, preset in presets.items():
-            if filter_str.lower() in name.lower():
-                brush_list.append(name)
-                if len(brush_list) >= limit:
-                    break
-
-        return {"status": "ok", "brushes": brush_list, "count": len(brush_list)}
-
-    def cmd_close_document(self, params):
-        """Close a document (default: active). Returns to the previous doc."""
-        doc, err = self._resolve_document(params)
-        if err:
-            return err
-        if not doc:
-            return {"error": "No active document"}
-        name = doc.name()
-        if not doc.close():
-            return {"error": f"Could not close document: {name}"}
-        return {"status": "ok", "closed": name}
-
-    def cmd_open_file(self, params):
-        """Open an existing file in Krita."""
-        filepath = params.get("path")
-        if not filepath:
-            return {"error": "No path specified"}
-
-        if not os.path.exists(filepath):
-            return {"error": f"File not found: {filepath}"}
-
-        app = Krita.instance()
-
-        # Open the document
-        doc = app.openDocument(filepath)
-        if not doc:
-            return {"error": f"Failed to open: {filepath}"}
-
-        # Add view to active window
-        window = app.activeWindow()
-        if window:
-            window.addView(doc)
-
-        return {"status": "ok", "path": filepath, "name": doc.name(), "width": doc.width(), "height": doc.height()}
-
-    # ------------------------------------------------------------------ v3
-    # Native surface. See docs/AUTOPAINTER/KRITA_MCP_SERVER_REQUIREMENTS.md.
-    # Capabilities must be queried before using these actions; never assume.
-
-    def cmd_capabilities(self, params):
-        return {
-            "status": "ok",
-            "plugin": "kritamcp",
-            "plugin_version": PLUGIN_VERSION,
-            "protocol_version": PROTOCOL_VERSION,
-            "krita_version": Krita.instance().version(),
-            "actions": [
-                "native_paint_path", "brush_state", "document_state",
-                "layer_list", "layer_create", "layer_select",
-                "layer_update", "layer_delete", "layer_duplicate",
-                "layer_merge_down", "begin_transaction",
-                "commit_transaction", "rollback_transaction",
-                "batch_actions", "capture", "save", "get_color_at",
-                "list_brushes", "open_file", "new_canvas",
-                "close_document",
-            ],
-            "native_brush_engine": True,
-            "per_point_pressure": True,
-            "reserved_fields": ["tilt", "rotation", "speed"],
-            "history_grouping": False,
-            "stable_resource_ids": False,  # scripting API exposes names only
-            "stable_node_ids": True,       # QUuid via nodeByUniqueID
-            "transaction_mode": "pixel_snapshot",
-            "transaction_scope": "paint_layer_pixels_only",
-            "transaction_notes": (
-                "Rollback restores pixel data of existing paint layers. "
-                "Structural changes (layer create/delete/merge) are NOT "
-                "rolled back; animated documents are unsupported."),
-            "allowlisted_roots": ALLOWED_ROOTS,
-            "limits": {
-                "max_path_points": MAX_PATH_POINTS,
-                "max_batch_actions": MAX_BATCH_ACTIONS,
-                "max_crop_pixels": MAX_CROP_PIXELS,
-            },
+            return PROTOCOL_STATE.dispatch(
+                envelope,
+                lambda action, params: self._execute_action(action, params, envelope),
+            )
+        except ProtocolError as error:
+            return error_response(request_id, error)
+        except Exception:
+            return error_response(
+                request_id,
+                ProtocolError(
+                    "internal_error",
+                    "Krita could not complete the command; inspect the local Krita log",
+                    retryable=False,
+                    http_status=500,
+                ),
+            )
+
+    def _execute_action(self, action: str, params: dict, envelope: dict) -> dict:
+        handlers = {
+            "get_capabilities": self._get_capabilities,
+            "get_state": self._get_state,
+            "create_document": self._create_document,
+            "open_document": self._open_document,
+            "save_document": self._save_document,
+            "export_document": self._export_document,
+            "close_document": self._close_document,
+            "list_layers": self._list_layers,
+            "create_layer": self._create_layer,
+            "update_layer": self._update_layer,
+            "delete_layer": self._delete_layer,
+            "set_selection_from_mask": self._set_selection_from_mask,
+            "clear_selection": self._clear_selection,
+            "list_brushes": self._list_brushes,
+            "render_brush_probe": self._render_brush_probe,
+            "begin_paint_transaction": self._begin_transaction,
+            "paint_strokes": self._paint_strokes,
+            "commit_paint_transaction": self._commit_transaction,
+            "rollback_paint_transaction": self._rollback_transaction,
+            "capture_region": self._capture_region,
         }
+        return handlers[action](params, envelope)
 
-    def _resolve_document(self, params):
-        """Return (doc, error). Honours params['document'] (document name)."""
-        doc_name = params.get("document")
-        if not doc_name:
-            return self.get_active_document(), None
-        for d in Krita.instance().documents():
-            if d.name() == doc_name:
-                return d, None
-        return None, {"error": f"Document not found: {doc_name}"}
+    @staticmethod
+    def _app():
+        return Krita.instance()
 
-    def _resolve_node(self, doc, node_id=None):
-        """Return (node, error). Honours params['node_id'] (node QUuid)."""
+    def _active_view(self):
+        window = self._app().activeWindow()
+        view = window.activeView() if window else None
+        if view is None:
+            raise ProtocolError("no_active_view", "Krita has no active canvas view")
+        return view
+
+    def _register_document(self, document) -> str:
+        object_key = id(document)
+        document_id = self._document_ids.get(object_key)
+        if document_id is None:
+            document_id = str(uuid.uuid4())
+            self._document_ids[object_key] = document_id
+            self._documents[document_id] = document
+        return document_id
+
+    def _forget_document(self, document_id: str) -> None:
+        document = self._documents.pop(document_id, None)
+        if document is not None:
+            self._document_ids.pop(id(document), None)
+
+    def _document(self, envelope: dict):
+        document_id = envelope.get("document_id")
+        open_documents = self._app().documents()
+        if document_id:
+            document = self._documents.get(document_id)
+            if document is None or document not in open_documents:
+                self._forget_document(document_id)
+                raise ProtocolError("document_not_found", "document_id is not open")
+            return document_id, document
+        document = self._app().activeDocument()
+        if document is None:
+            raise ProtocolError("no_active_document", "Krita has no active document")
+        return self._register_document(document), document
+
+    @staticmethod
+    def _node(document, node_id: str):
         if not node_id:
-            return doc.activeNode(), None
-        node = doc.nodeByUniqueID(QUuid(node_id))
+            raise ProtocolError("node_id_required", "node_id is required")
+        node = document.nodeByUniqueID(QUuid(str(node_id)))
         if node is None:
-            return None, {"error": f"Node not found: {node_id}"}
-        return node, None
+            raise ProtocolError("node_not_found", "node_id was not found in the document")
+        return node
 
-    def _apply_preset(self, view, preset_name):
-        found = None
-        for name, preset in Krita.instance().resources("preset").items():
-            if name == preset_name:
-                found = preset
-                break
-        if found is None:
-            for name, preset in Krita.instance().resources("preset").items():
-                if preset_name.lower() in name.lower():
-                    found = preset
-                    break
-        if not found:
-            return False
-        view.setCurrentBrushPreset(found)
-        return True
-
-    # None = probe on first paint; True/False = Krita build's paintLine takes
-    # QPoint (5.2-style bindings, e.g. Krita 6 PyQt6) or QPointF (master).
-    _paint_segment_uses_qpoint = None
-
-    def _paint_segment(self, layer, x1, y1, p1, x2, y2, p2, stroke_style):
-        """One paintLine segment, tolerant to both endpoint-type signatures.
-
-        The probe raises before painting anything, so no stroke is
-        partially drawn by a failed attempt.
-        """
-        if self._paint_segment_uses_qpoint is None:
-            try:
-                layer.paintLine(QPointF(x1, y1), QPointF(x2, y2), p1, p2,
-                                stroke_style)
-                self._paint_segment_uses_qpoint = False
-                return
-            except TypeError:
-                self._paint_segment_uses_qpoint = True
-        if self._paint_segment_uses_qpoint:
-            layer.paintLine(QPoint(int(round(x1)), int(round(y1))),
-                            QPoint(int(round(x2)), int(round(y2))),
-                            p1, p2, stroke_style)
-        else:
-            layer.paintLine(QPointF(x1, y1), QPointF(x2, y2), p1, p2,
-                            stroke_style)
-
-    def cmd_native_paint_path(self, params):
-        """Pressure-aware path painted by Krita's native brush engine.
-
-        Uses Node.paintLine() per consecutive point pair. The current brush
-        preset, size, opacity, flow and colours are taken from canvas view
-        resources (set here from the request). Each segment is one undo
-        entry; grouping is not exposed by the scripting API.
-        """
-        view = self.get_active_view()
-        if not view:
-            return {"error": "No active view"}
-        doc, err = self._resolve_document(params)
-        if err:
-            return err
-        layer, err = self._resolve_node(doc, params.get("node_id"))
-        if err:
-            return err
-        if layer is None:
-            return {"error": "No active layer"}
-
-        points = params.get("points", [])
-        if len(points) < 2:
-            return {"error": "Need at least 2 points for a path"}
-        if len(points) > MAX_PATH_POINTS:
-            return {"error": f"Too many path points (max {MAX_PATH_POINTS})"}
-
-        norm_points = []
-        for p in points:
-            if isinstance(p, dict):
-                px, py = float(p.get("x", 0)), float(p.get("y", 0))
-                pr = _clamp(float(p.get("pressure", 1.0)), 0.0, 1.0)
-            else:
-                px, py = float(p[0]), float(p[1])
-                pr = 1.0
-            norm_points.append((px, py, pr))
-
-        kind = params.get("kind", "paint")
-        if kind not in ("paint", "erase"):
-            return {"error": f"Unknown path kind: {kind}"}
-
-        prev_eraser = view.eraserMode()
-        prev_pressure_disabled = view.disablePressure()
-        try:
-            preset_name = params.get("preset")
-            if preset_name and not self._apply_preset(view, preset_name):
-                return {"error": f"Brush preset not found: {preset_name}"}
-            if params.get("size") is not None:
-                view.setBrushSize(_clamp(float(params["size"]), 1.0, 4000.0))
-            if params.get("opacity") is not None:
-                view.setPaintingOpacity(_clamp(float(params["opacity"]), 0.0, 1.0))
-            if params.get("flow") is not None:
-                view.setPaintingFlow(_clamp(float(params["flow"]), 0.0, 1.0))
-            if params.get("blending_mode"):
-                view.setCurrentBlendingMode(str(params["blending_mode"]))
-            if params.get("colour"):
-                color = QColor(str(params["colour"]))
-                view.setForeGroundColor(
-                    ManagedColor.fromQColor(color, view.canvas()))
-            # Per-point pressures must reach the brush engine.
-            view.setDisablePressure(False)
-            view.setEraserMode(kind == "erase")
-
-            stroke_style = "ForegroundColor" if kind == "paint" else "None"
-            start = time.time()
-            for i in range(1, len(norm_points)):
-                x1, y1, p1 = norm_points[i - 1]
-                x2, y2, p2 = norm_points[i]
-                self._paint_segment(layer, x1, y1, p1, x2, y2, p2,
-                                    stroke_style)
-            doc.refreshProjection()
-            elapsed_ms = int((time.time() - start) * 1000)
-        finally:
-            view.setEraserMode(prev_eraser)
-            view.setDisablePressure(prev_pressure_disabled)
-
-        size = view.brushSize()
-        pad = size / 2.0 + 2.0
-        xs = [p[0] for p in norm_points]
-        ys = [p[1] for p in norm_points]
-        bbox = [
-            max(0, int(min(xs) - pad)),
-            max(0, int(min(ys) - pad)),
-            min(doc.width(), int(max(xs) + pad) + 1) - max(0, int(min(xs) - pad)),
-            min(doc.height(), int(max(ys) + pad) + 1) - max(0, int(min(ys) - pad)),
-        ]
+    @staticmethod
+    def _node_entry(node) -> dict:
         return {
-            "status": "ok",
-            "kind": kind,
-            "points_count": len(norm_points),
-            "size": size,
-            "opacity": view.paintingOpacity(),
-            "flow": view.paintingFlow(),
-            "bbox": bbox,
-            "render_ms": elapsed_ms,
-        }
-
-    def cmd_brush_state(self, params):
-        """Read (and optionally write) brush/tool state. Empty params = read."""
-        view = self.get_active_view()
-        if not view:
-            return {"error": "No active view"}
-
-        if params.get("preset"):
-            if not self._apply_preset(view, params["preset"]):
-                return {"error": f"Brush preset not found: {params['preset']}"}
-        if params.get("size") is not None:
-            view.setBrushSize(_clamp(float(params["size"]), 1.0, 4000.0))
-        if params.get("opacity") is not None:
-            view.setPaintingOpacity(_clamp(float(params["opacity"]), 0.0, 1.0))
-        if params.get("flow") is not None:
-            view.setPaintingFlow(_clamp(float(params["flow"]), 0.0, 1.0))
-        if params.get("blending_mode"):
-            view.setCurrentBlendingMode(str(params["blending_mode"]))
-        if params.get("eraser") is not None:
-            view.setEraserMode(bool(params["eraser"]))
-        if params.get("disable_pressure") is not None:
-            view.setDisablePressure(bool(params["disable_pressure"]))
-        if params.get("colour"):
-            view.setForeGroundColor(ManagedColor.fromQColor(
-                QColor(str(params["colour"])), view.canvas()))
-        if params.get("background"):
-            view.setBackGroundColor(ManagedColor.fromQColor(
-                QColor(str(params["background"])), view.canvas()))
-
-        preset = view.currentBrushPreset()
-        fg = view.foregroundColor().colorForCanvas(view.canvas())
-        bg = view.backgroundColor().colorForCanvas(view.canvas())
-        return {
-            "status": "ok",
-            "preset": preset.name() if preset else None,
-            "preset_id": preset.name() if preset else None,  # names only today
-            "size": view.brushSize(),
-            "opacity": view.paintingOpacity(),
-            "flow": view.paintingFlow(),
-            "blending_mode": view.currentBlendingMode(),
-            "eraser": view.eraserMode(),
-            "disable_pressure": view.disablePressure(),
-            "colour": "#{:02x}{:02x}{:02x}".format(fg.red(), fg.green(), fg.blue()),
-            "background": "#{:02x}{:02x}{:02x}".format(bg.red(), bg.green(), bg.blue()),
-        }
-
-    def cmd_document_state(self, params):
-        doc, err = self._resolve_document(params)
-        if err:
-            return err
-        if not doc:
-            return {"error": "No active document"}
-        active = doc.activeNode()
-        return {
-            "status": "ok",
-            "document_id": doc.name(),  # scripting API exposes names only
-            "name": doc.name(),
-            "file_path": doc.fileName(),
-            "width": doc.width(),
-            "height": doc.height(),
-            "resolution": doc.resolution(),
-            "color_model": doc.colorModel(),
-            "color_depth": doc.colorDepth(),
-            "color_profile": doc.colorProfile(),
-            "active_node_id": active.uniqueId().toString() if active else None,
-            "active_node_name": active.name() if active else None,
-            "modified": doc.modified(),
-        }
-
-    def _node_entry(self, node):
-        entry = {
             "id": node.uniqueId().toString(),
             "name": node.name(),
             "type": node.type(),
             "visible": node.visible(),
+            "locked": node.locked(),
             "opacity": node.opacity(),
             "blend_mode": node.blendingMode(),
-            "locked": node.locked(),
-            "alpha_locked": node.alphaLocked(),
-            "inherit_alpha": node.inheritAlpha(),
-            "children": [],
+            "children": [KritaMCPExtension._node_entry(child) for child in node.childNodes()],
         }
-        for child in node.childNodes():
-            entry["children"].append(self._node_entry(child))
-        return entry
 
-    def cmd_layer_list(self, params):
-        doc, err = self._resolve_document(params)
-        if err:
-            return err
-        if not doc:
-            return {"error": "No active document"}
-        return {"status": "ok", "root": self._node_entry(doc.rootNode())}
-
-    def cmd_layer_create(self, params):
-        doc, err = self._resolve_document(params)
-        if err:
-            return err
-        if not doc:
-            return {"error": "No active document"}
-        name = params.get("name", "layer")
-        node_type = params.get("type", "paintlayer")
-        parent, err = self._resolve_node(doc, params.get("parent_id"))
-        if err:
-            return err
-        node = doc.createNode(name, node_type)
-        if node is None:
-            return {"error": f"Could not create node of type {node_type}"}
-        if params.get("above_id"):
-            above, aerr = self._resolve_node(doc, params["above_id"])
-            if aerr:
-                return aerr
-            parent.addChildNode(node, above)
-        else:
-            parent.addChildNode(node, None)
-        if params.get("select", True):
-            doc.setActiveNode(node)
-        doc.refreshProjection()
-        return {"status": "ok", "id": node.uniqueId().toString(),
-                "name": node.name(), "type": node.type()}
-
-    def cmd_layer_select(self, params):
-        doc, err = self._resolve_document(params)
-        if err:
-            return err
-        if not doc:
-            return {"error": "No active document"}
-        node, err = self._resolve_node(doc, params.get("node_id"))
-        if err:
-            return err
-        if node is None:
-            node = doc.nodeByName(params.get("name", ""))
-            if node is None:
-                return {"error": "Node not found"}
-        doc.setActiveNode(node)
-        return {"status": "ok", "id": node.uniqueId().toString(),
-                "name": node.name()}
-
-    def cmd_layer_update(self, params):
-        doc, err = self._resolve_document(params)
-        if err:
-            return err
-        if not doc:
-            return {"error": "No active document"}
-        node, err = self._resolve_node(doc, params.get("node_id"))
-        if err:
-            return err
-        if node is None:
-            return {"error": "Node not found"}
-        if params.get("name"):
-            node.setName(str(params["name"]))
-        if params.get("visible") is not None:
-            node.setVisible(bool(params["visible"]))
-        if params.get("locked") is not None:
-            node.setLocked(bool(params["locked"]))
-        if params.get("alpha_locked") is not None:
-            node.setAlphaLocked(bool(params["alpha_locked"]))
-        if params.get("inherit_alpha") is not None:
-            node.setInheritAlpha(bool(params["inherit_alpha"]))
-        if params.get("opacity") is not None:
-            node.setOpacity(_clamp(int(params["opacity"]), 0, 255))
-        if params.get("blend_mode"):
-            node.setBlendingMode(str(params["blend_mode"]))
-        if params.get("move_x") or params.get("move_y"):
-            node.move(int(params.get("move_x", 0)), int(params.get("move_y", 0)))
-        doc.refreshProjection()
-        return {"status": "ok", "id": node.uniqueId().toString()}
-
-    def cmd_layer_delete(self, params):
-        doc, err = self._resolve_document(params)
-        if err:
-            return err
-        if not doc:
-            return {"error": "No active document"}
-        node, err = self._resolve_node(doc, params.get("node_id"))
-        if err:
-            return err
-        if node is None:
-            return {"error": "Node not found"}
-        ok = node.remove()
-        doc.refreshProjection()
-        return {"status": "ok"} if ok else {"error": "remove() failed"}
-
-    def cmd_layer_duplicate(self, params):
-        doc, err = self._resolve_document(params)
-        if err:
-            return err
-        if not doc:
-            return {"error": "No active document"}
-        node, err = self._resolve_node(doc, params.get("node_id"))
-        if err:
-            return err
-        if node is None:
-            return {"error": "Node not found"}
-        clone = node.clone()
-        parent = node.parentNode()
-        if not parent.addChildNode(clone, node):
-            return {"error": "addChildNode failed"}
-        doc.refreshProjection()
-        return {"status": "ok", "id": clone.uniqueId().toString(),
-                "name": clone.name()}
-
-    def cmd_layer_merge_down(self, params):
-        doc, err = self._resolve_document(params)
-        if err:
-            return err
-        if not doc:
-            return {"error": "No active document"}
-        node, err = self._resolve_node(doc, params.get("node_id"))
-        if err:
-            return err
-        if node is None:
-            return {"error": "Node not found"}
-        merged = node.mergeDown()
-        if merged is None:
-            return {"error": "mergeDown failed"}
-        doc.refreshProjection()
-        return {"status": "ok", "id": merged.uniqueId().toString(),
-                "name": merged.name()}
-
-    def _snapshot_paint_layers(self, doc, node):
-        snapshot = {}
-        w, h = doc.width(), doc.height()
-        for child in node.childNodes():
-            snapshot.update(self._snapshot_paint_layers(doc, child))
-        if node.type() in ("paintlayer",) and node.hasExtents():
-            snapshot[node.uniqueId().toString()] = {
-                "x": 0, "y": 0, "w": w, "h": h,
-                "data": bytes(node.pixelData(0, 0, w, h)),
-            }
-        return snapshot
-
-    def cmd_begin_transaction(self, params):
-        doc, err = self._resolve_document(params)
-        if err:
-            return err
-        if not doc:
-            return {"error": "No active document"}
-        tid = str(uuid.uuid4())
-        snapshot = self._snapshot_paint_layers(doc, doc.rootNode())
-        total_bytes = sum(s["w"] * s["h"] * 4 for s in snapshot.values())
-        if total_bytes > MAX_TRANSACTION_BYTES:
-            return {
-                "error": (
-                    f"Transaction snapshot would need ~{total_bytes // (1024 * 1024)} MB "
-                    f"(limit {MAX_TRANSACTION_BYTES // (1024 * 1024)} MB); "
-                    "reduce canvas size or paint layers"),
-            }
-        self.transactions[tid] = {
-            "document": doc.name(),
-            "label": params.get("label", ""),
-            "snapshot": snapshot,
-            "created": time.time(),
-        }
-        return {"status": "ok", "transaction_id": tid,
-                "nodes": len(self.transactions[tid]["snapshot"])}
-
-    def cmd_commit_transaction(self, params):
-        tid = params.get("transaction_id")
-        if tid not in self.transactions:
-            return {"error": f"Unknown transaction: {tid}"}
-        nodes = len(self.transactions.pop(tid)["snapshot"])
-        return {"status": "ok", "transaction_id": tid, "released_nodes": nodes}
-
-    def cmd_rollback_transaction(self, params):
-        tid = params.get("transaction_id")
-        if tid not in self.transactions:
-            return {"error": f"Unknown transaction: {tid}"}
-        txn = self.transactions.pop(tid)
-        doc, err = self._resolve_document({"document": txn["document"]})
-        if err or not doc:
-            return {"error": "Document for transaction is gone"}
-        restored = 0
-        for node_id, snap in txn["snapshot"].items():
-            node = doc.nodeByUniqueID(QUuid(node_id))
-            if node is None:
-                continue
-            node.setPixelData(QByteArray(snap["data"]), snap["x"], snap["y"],
-                              snap["w"], snap["h"])
-            restored += 1
-        doc.refreshProjection()
-        return {"status": "ok", "transaction_id": tid, "restored_nodes": restored}
-
-    def cmd_batch_actions(self, params):
-        """Execute a list of {action, params} in order, with optional atomicity.
-
-        atomic=true wraps the batch in a pixel-snapshot transaction and rolls
-        back if any action errors, so a batch is accepted or rejected as one
-        candidate — the AutoPainter contract.
-        """
-        actions = params.get("actions", [])
-        if not actions:
-            return {"error": "No actions supplied"}
-        if len(actions) > MAX_BATCH_ACTIONS:
-            return {"error": f"Too many actions (max {MAX_BATCH_ACTIONS})"}
-
-        atomic = bool(params.get("atomic", True))
-        if atomic:
-            structural = [a.get("action") for a in actions
-                          if a.get("action") in STRUCTURAL_ACTIONS]
-            if structural:
-                return {
-                    "error": (
-                        "Structural actions cannot be part of an atomic "
-                        "batch (pixel-snapshot rollback covers paint-layer "
-                        "pixels only): " + ", ".join(structural)),
-                }
-        tid = None
-        if atomic:
-            t = self.cmd_begin_transaction({"label": "batch_actions"})
-            if "error" in t:
-                return t
-            tid = t["transaction_id"]
-
-        results = []
-        failed = False
-        start = time.time()
-        for entry in actions:
-            sub_action = entry.get("action")
-            sub_params = entry.get("params", {})
-            if sub_action == "batch_actions":
-                result = {"error": "Nested batch_actions are not allowed"}
-            else:
-                result = self.execute_command(
-                    {"action": sub_action, "params": sub_params})
-            results.append(result)
-            if "error" in result and not failed:
-                failed = True
-                if atomic:
-                    break
-
-        rolled_back = False
-        if failed and atomic:
-            rb = self.cmd_rollback_transaction({"transaction_id": tid})
-            rolled_back = "error" not in rb
-        elif atomic:
-            self.cmd_commit_transaction({"transaction_id": tid})
-
+    def _document_state(self, document_id: str, document) -> dict:
+        active = document.activeNode()
         return {
-            "status": "error" if failed else "ok",
-            "results": results,
-            "executed": len(results),
-            "rolled_back": rolled_back,
-            "elapsed_ms": int((time.time() - start) * 1000),
+            "document_id": document_id,
+            "name": document.name(),
+            "file_path": document.fileName(),
+            "width": document.width(),
+            "height": document.height(),
+            "resolution_ppi": document.resolution(),
+            "color_model": document.colorModel(),
+            "color_depth": document.colorDepth(),
+            "color_profile": document.colorProfile(),
+            "modified": document.modified(),
+            "active_node_id": active.uniqueId().toString() if active else None,
         }
 
-    def cmd_capture(self, params):
-        """Capture a crop of the composite projection (or a node) as PNG.
+    def _get_capabilities(self, _params: dict, _envelope: dict) -> dict:
+        result = _capabilities()
+        result["krita_version"] = self._app().version()
+        result["profile_available"] = COLOR_PROFILE in self._app().profiles(
+            COLOR_MODEL, COLOR_DEPTH
+        )
+        return result
 
-        Returns the file path under an allowlisted root. Optional max_side
-        downsamples with smooth scaling. Bounded by MAX_CROP_PIXELS.
-        """
-        doc, err = self._resolve_document(params)
-        if err:
-            return err
-        if not doc:
-            return {"error": "No active document"}
-
-        x = int(params.get("x", 0))
-        y = int(params.get("y", 0))
-        w = int(params.get("w", doc.width()))
-        h = int(params.get("h", doc.height()))
-        if w * h > MAX_CROP_PIXELS:
-            return {"error": "Crop exceeds max_crop_pixels"}
-
-        node_id = params.get("node_id")
-        if node_id:
-            node, nerr = self._resolve_node(doc, node_id)
-            if nerr:
-                return nerr
-            data = node.pixelData(x, y, w, h)
+    def _get_state(self, _params: dict, envelope: dict) -> dict:
+        result = {
+            "bridge_revision": PROTOCOL_STATE.revision,
+            "writer_lease": PROTOCOL_STATE.writer_session is not None,
+        }
+        try:
+            document_id, document = self._document(envelope)
+        except ProtocolError as error:
+            if error.code != "no_active_document":
+                raise
+            result["document"] = None
         else:
-            data = doc.pixelData(x, y, w, h)
+            result["document"] = self._document_state(document_id, document)
+        return result
 
-        image = QImage(bytes(data), w, h, w * 4, QImage.Format.Format_ARGB32).copy()
-        # .copy() detaches from the Python buffer so save/scale can't
-        # outlive the pixelData byte object
-        max_side = params.get("max_side")
-        if max_side:
-            image = image.scaled(int(max_side), int(max_side),
-                                 aspectRatioMode=Qt.AspectRatioMode.KeepAspectRatio,
-                                 transformationMode=Qt.TransformationMode.SmoothTransformation)
+    @staticmethod
+    def _validate_canvas_size(width: int, height: int) -> tuple[int, int]:
+        if not isinstance(width, int) or not isinstance(height, int):
+            raise ProtocolError("invalid_document", "width and height must be integers")
+        if not 1 <= width <= 16384 or not 1 <= height <= 16384:
+            raise ProtocolError("invalid_document", "canvas dimensions must be in [1, 16384]")
+        return width, height
 
-        filename = params.get("filename", f"capture_{int(time.time())}.png")
-        if not filename.endswith(".png"):
-            filename += ".png"
-        filepath = _path_allowed(os.path.join(CANVAS_OUTPUT_DIR, filename))
-        if not filepath:
-            return {"error": "Path outside allowlisted roots"}
-        if not image.save(filepath, "PNG"):
-            return {"error": f"Could not save capture: {filepath}"}
-        return {"status": "ok", "path": filepath, "width": image.width(),
-                "height": image.height(), "revision": int(time.time())}
+    @staticmethod
+    def _rgba(value) -> tuple[int, int, int, int]:
+        if (
+            not isinstance(value, list)
+            or len(value) != 4
+            or any(not isinstance(channel, int) or not 0 <= channel <= 255 for channel in value)
+        ):
+            raise ProtocolError("invalid_color", "RGBA must be four integer channels in [0, 255]")
+        return tuple(value)
+
+    @staticmethod
+    def _fill_u16(layer, width: int, height: int, rgba: tuple[int, int, int, int]) -> None:
+        red, green, blue, alpha = (channel * 257 for channel in rgba)
+        pixel = struct.pack("=HHHH", blue, green, red, alpha)
+        if not layer.setPixelData(QByteArray(pixel * (width * height)), 0, 0, width, height):
+            raise ProtocolError("substrate_failed", "could not initialize the neutral substrate")
+
+    def _create_document(self, params: dict, _envelope: dict) -> dict:
+        width, height = self._validate_canvas_size(params.get("width"), params.get("height"))
+        name = str(params.get("name") or "AutoPainter v4")
+        background = self._rgba(params.get("background_rgba", [232, 228, 218, 255]))
+        if COLOR_PROFILE not in self._app().profiles(COLOR_MODEL, COLOR_DEPTH):
+            raise ProtocolError(
+                "color_profile_unavailable",
+                f"required Krita profile is unavailable: {COLOR_PROFILE}",
+            )
+        document = self._app().createDocument(
+            width,
+            height,
+            name,
+            COLOR_MODEL,
+            COLOR_DEPTH,
+            COLOR_PROFILE,
+            RESOLUTION_PPI,
+        )
+        if document is None:
+            raise ProtocolError("document_create_failed", "Krita could not create the document")
+        window = self._app().activeWindow()
+        if window is not None:
+            window.addView(document)
+        substrate = document.activeNode()
+        if substrate is None:
+            substrate = document.createNode("00 Ground", "paintlayer")
+            document.rootNode().addChildNode(substrate, None)
+        substrate.setName("00 Ground")
+        self._fill_u16(substrate, width, height, background)
+        document.setActiveNode(substrate)
+        document.refreshProjection()
+        document_id = self._register_document(document)
+        state = self._document_state(document_id, document)
+        expected = (COLOR_MODEL, COLOR_DEPTH, COLOR_PROFILE, int(RESOLUTION_PPI))
+        actual = (
+            state["color_model"],
+            state["color_depth"],
+            state["color_profile"],
+            int(state["resolution_ppi"]),
+        )
+        if actual != expected:
+            document.close()
+            self._forget_document(document_id)
+            raise ProtocolError(
+                "document_invariant_failed",
+                "Krita created a document with unexpected color settings",
+                details={"expected": expected, "actual": actual},
+            )
+        state["substrate_node_id"] = substrate.uniqueId().toString()
+        return state
+
+    def _open_document(self, params: dict, _envelope: dict) -> dict:
+        path = PATH_GUARD.resolve_read(params.get("path", ""))
+        document = self._app().openDocument(str(path))
+        if document is None:
+            raise ProtocolError("document_open_failed", "Krita could not open the document")
+        window = self._app().activeWindow()
+        if window is not None:
+            window.addView(document)
+        document_id = self._register_document(document)
+        return self._document_state(document_id, document)
+
+    def _save_document(self, params: dict, envelope: dict) -> dict:
+        document_id, document = self._document(envelope)
+        requested = params.get("path")
+        if requested:
+            path = PATH_GUARD.resolve_write(requested)
+            if path.suffix.lower() != ".kra":
+                raise ProtocolError("invalid_format", "save_document requires a .kra path")
+            ok = document.saveAs(str(path))
+        else:
+            if not document.fileName():
+                raise ProtocolError("path_required", "an unsaved document requires a .kra path")
+            path = PATH_GUARD.resolve_write(document.fileName())
+            if path.suffix.lower() != ".kra":
+                raise ProtocolError("invalid_format", "save_document requires a .kra path")
+            ok = document.save()
+        if not ok:
+            raise ProtocolError("save_failed", "Krita could not save the KRA document")
+        return {"document_id": document_id, "path": str(path)}
+
+    def _export_document(self, params: dict, envelope: dict) -> dict:
+        document_id, document = self._document(envelope)
+        path = PATH_GUARD.resolve_write(params.get("path", ""))
+        if path.suffix.lower() != ".png":
+            raise ProtocolError("invalid_format", "export_document currently requires a .png path")
+        configuration = InfoObject()
+        configuration.setProperty("alpha", True)
+        if not document.exportImage(str(path), configuration):
+            raise ProtocolError("export_failed", "Krita could not export the PNG")
+        return {
+            "document_id": document_id,
+            "path": str(path),
+            "color_depth": document.colorDepth(),
+        }
+
+    def _close_document(self, _params: dict, envelope: dict) -> dict:
+        document_id, document = self._document(envelope)
+        for transaction_id, transaction in list(PROTOCOL_STATE.transactions.items()):
+            if transaction["document_id"] == document_id:
+                self._rollback_internal(transaction_id, document)
+        if not document.close():
+            raise ProtocolError("close_failed", "Krita refused to close the document")
+        self._forget_document(document_id)
+        return {"document_id": document_id, "closed": True}
+
+    def _list_layers(self, _params: dict, envelope: dict) -> dict:
+        document_id, document = self._document(envelope)
+        return {"document_id": document_id, "root": self._node_entry(document.rootNode())}
+
+    def _create_layer(self, params: dict, envelope: dict) -> dict:
+        document_id, document = self._document(envelope)
+        name = str(params.get("name") or "Layer")
+        if name.startswith(TRANSACTION_PREFIX):
+            raise ProtocolError("reserved_name", "that layer-name prefix is plugin-owned")
+        node_type = params.get("type", "paintlayer")
+        allowed = {"paintlayer", "grouplayer", "selectionmask"}
+        if node_type not in allowed:
+            raise ProtocolError(
+                "unsupported_layer_type",
+                "layer type must be paintlayer, grouplayer, or selectionmask",
+            )
+        if node_type == "grouplayer":
+            node = document.createGroupLayer(name)
+        elif node_type == "selectionmask":
+            node = document.createSelectionMask(name)
+        else:
+            node = document.createNode(name, "paintlayer")
+        parent = (
+            self._node(document, params["parent_id"])
+            if params.get("parent_id")
+            else document.rootNode()
+        )
+        above = self._node(document, params["above_id"]) if params.get("above_id") else None
+        if not parent.addChildNode(node, above):
+            raise ProtocolError("layer_create_failed", "Krita could not attach the new layer")
+        if params.get("select", True):
+            document.setActiveNode(node)
+        document.refreshProjection()
+        return {
+            "document_id": document_id,
+            "node": self._node_entry(node),
+        }
+
+    def _update_layer(self, params: dict, envelope: dict) -> dict:
+        document_id, document = self._document(envelope)
+        node = self._node(document, params.get("node_id"))
+        if "name" in params:
+            name = str(params["name"])
+            if name.startswith(TRANSACTION_PREFIX):
+                raise ProtocolError("reserved_name", "that layer-name prefix is plugin-owned")
+            node.setName(name)
+        if "visible" in params:
+            node.setVisible(bool(params["visible"]))
+        if "locked" in params:
+            node.setLocked(bool(params["locked"]))
+        if "opacity" in params:
+            opacity = params["opacity"]
+            if not isinstance(opacity, int) or not 0 <= opacity <= 255:
+                raise ProtocolError("invalid_layer", "opacity must be an integer in [0, 255]")
+            node.setOpacity(opacity)
+        if "blend_mode" in params:
+            node.setBlendingMode(str(params["blend_mode"]))
+        document.refreshProjection()
+        return {"document_id": document_id, "node": self._node_entry(node)}
+
+    def _delete_layer(self, params: dict, envelope: dict) -> dict:
+        document_id, document = self._document(envelope)
+        node = self._node(document, params.get("node_id"))
+        node_id = node.uniqueId().toString()
+        if node.name().startswith(TRANSACTION_PREFIX):
+            orphan_cleanup = params.get("orphan_cleanup") is True
+            if not orphan_cleanup:
+                raise ProtocolError(
+                    "transaction_required", "plugin-owned candidate layers must be rolled back"
+                )
+            if any(
+                transaction.get("layer_id") == node_id
+                for transaction in PROTOCOL_STATE.transactions.values()
+            ):
+                raise ProtocolError(
+                    "transaction_active", "a live transaction candidate cannot be orphan-cleaned"
+                )
+        if not node.remove():
+            raise ProtocolError("layer_delete_failed", "Krita could not delete the layer")
+        document.refreshProjection()
+        return {"document_id": document_id, "deleted_node_id": node_id}
+
+    @staticmethod
+    def _image_bytes(image: QImage) -> bytes:
+        pointer = image.constBits()
+        pointer.setsize(image.sizeInBytes())
+        raw = bytes(pointer)
+        width = image.width()
+        if image.bytesPerLine() == width:
+            return raw
+        stride = image.bytesPerLine()
+        return b"".join(raw[row * stride : row * stride + width] for row in range(image.height()))
+
+    def _set_selection_from_mask(self, params: dict, envelope: dict) -> dict:
+        document_id, document = self._document(envelope)
+        path = PATH_GUARD.resolve_read(params.get("path", ""))
+        if path.suffix.lower() != ".png":
+            raise ProtocolError("invalid_format", "selection masks must be PNG files")
+        image = QImage(str(path))
+        if image.isNull():
+            raise ProtocolError("invalid_mask", "Krita could not decode the mask PNG")
+        if image.width() != document.width() or image.height() != document.height():
+            raise ProtocolError(
+                "mask_size_mismatch",
+                "selection mask dimensions must equal the document dimensions",
+            )
+        grayscale = image.convertToFormat(QImage.Format.Format_Grayscale8)
+        selection = Selection()
+        selection.setPixelData(
+            QByteArray(self._image_bytes(grayscale)),
+            0,
+            0,
+            document.width(),
+            document.height(),
+        )
+        document.setSelection(selection)
+        mask_node_id = params.get("selection_mask_node_id")
+        if mask_node_id:
+            mask_node = self._node(document, mask_node_id)
+            if mask_node.type() != "selectionmask":
+                raise ProtocolError("invalid_mask_node", "node is not a selection mask")
+            mask_node.setSelection(selection.duplicate())
+        document.refreshProjection()
+        return {
+            "document_id": document_id,
+            "path": str(path),
+            "selection_mask_node_id": mask_node_id,
+        }
+
+    def _clear_selection(self, _params: dict, envelope: dict) -> dict:
+        document_id, document = self._document(envelope)
+        selection = document.selection()
+        if selection is not None:
+            selection.clear()
+            document.setSelection(selection)
+        return {"document_id": document_id, "cleared": True}
+
+    @staticmethod
+    def _resource_hash(resource) -> str | None:
+        filename = resource.filename()
+        if not filename:
+            return None
+        path = Path(filename).expanduser()
+        if not path.is_file():
+            return None
+        try:
+            digest = hashlib.sha256()
+            with path.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            return digest.hexdigest()
+        except OSError:
+            return None
+
+    def _catalog_brushes(self) -> list[dict]:
+        catalog = []
+        self._brushes = {}
+        for _key, resource in self._app().resources("preset").items():
+            filename = resource.filename() or None
+            file_hash = self._resource_hash(resource)
+            preset_id = brush_fingerprint("preset", resource.name(), filename, file_hash)
+            if preset_id in self._brushes:
+                raise ProtocolError(
+                    "resource_collision",
+                    "two installed brush resources have the same stable identity",
+                    details={"preset_id": preset_id},
+                )
+            self._brushes[preset_id] = resource
+            catalog.append(
+                {
+                    "preset_id": preset_id,
+                    "resource_type": "preset",
+                    "name": resource.name(),
+                    "filename": filename,
+                    "file_sha256": file_hash,
+                }
+            )
+        return sorted(catalog, key=lambda item: (item["name"].casefold(), item["preset_id"]))
+
+    def _list_brushes(self, params: dict, _envelope: dict) -> dict:
+        brushes = self._catalog_brushes()
+        query = str(params.get("query") or "").casefold()
+        if query:
+            brushes = [item for item in brushes if query in item["name"].casefold()]
+        return {"brushes": brushes, "count": len(brushes)}
+
+    def _brush(self, preset_id: str):
+        if not self._brushes:
+            self._catalog_brushes()
+        resource = self._brushes.get(preset_id)
+        if resource is None:
+            self._catalog_brushes()
+            resource = self._brushes.get(preset_id)
+        if resource is None:
+            raise ProtocolError("brush_not_found", "preset_id is not installed")
+        return resource
+
+    @staticmethod
+    def _color(value: list[int]) -> QColor:
+        red, green, blue, alpha = value
+        return QColor(red, green, blue, alpha)
+
+    def _apply_stroke_settings(self, view, stroke: dict) -> object:
+        resource = self._brush(stroke["preset_id"])
+        view.setCurrentBrushPreset(resource)
+        view.setBrushSize(float(stroke["size"]))
+        view.setPaintingOpacity(float(stroke["opacity"]))
+        view.setPaintingFlow(float(stroke["flow"]))
+        view.setCurrentBlendingMode(stroke["blend_mode"])
+        view.setEraserMode(stroke["erase"])
+        view.setForeGroundColor(
+            ManagedColor.fromQColor(self._color(stroke["foreground_rgba"]), view.canvas())
+        )
+        return resource
+
+    @staticmethod
+    def _bbox_for_geometry(document, geometry: dict, size: float) -> list[int]:
+        if geometry["type"] == "line":
+            points = [geometry["start"], geometry["end"]]
+        else:
+            points = [geometry["start"]]
+            for command in geometry["commands"]:
+                points.extend((command["control1"], command["control2"], command["end"]))
+        # Textured/scattered presets may place dabs outside the nominal brush
+        # radius. The conservative bound keeps trace crops lossless without a
+        # full-canvas snapshot.
+        padding = float(size) * 2.0 + 3.0
+        left = max(0, int(min(point[0] for point in points) - padding))
+        top = max(0, int(min(point[1] for point in points) - padding))
+        right = min(document.width(), int(max(point[0] for point in points) + padding) + 1)
+        bottom = min(document.height(), int(max(point[1] for point in points) + padding) + 1)
+        return [left, top, max(0, right - left), max(0, bottom - top)]
+
+    def _paint_one(self, document, layer, view, stroke: dict) -> dict:
+        resource = self._apply_stroke_settings(view, stroke)
+        geometry = stroke["geometry"]
+        start_time = time.perf_counter()
+        if geometry["type"] == "line":
+            view.setDisablePressure(False)
+            layer.paintLine(
+                QPointF(*geometry["start"]),
+                QPointF(*geometry["end"]),
+                float(stroke["pressure"]["start"]),
+                float(stroke["pressure"]["end"]),
+                "ForegroundColor",
+            )
+        else:
+            view.setDisablePressure(True)
+            path = QPainterPath(QPointF(*geometry["start"]))
+            for command in geometry["commands"]:
+                path.cubicTo(
+                    QPointF(*command["control1"]),
+                    QPointF(*command["control2"]),
+                    QPointF(*command["end"]),
+                )
+            layer.paintPath(path, "ForegroundColor", "None")
+        document.refreshProjection()
+        elapsed_ms = int((time.perf_counter() - start_time) * 1000)
+        filename = resource.filename() or None
+        return {
+            "stroke_id": stroke["stroke_id"],
+            "effective_brush_fingerprint": brush_fingerprint(
+                "preset", resource.name(), filename, self._resource_hash(resource)
+            ),
+            "bbox": self._bbox_for_geometry(document, geometry, stroke["size"]),
+            "render_ms": elapsed_ms,
+        }
+
+    @staticmethod
+    def _srgb8_projection(document, bbox: list[int] | None = None) -> QImage:
+        if bbox is None:
+            image = document.projection()
+        else:
+            image = document.projection(*bbox)
+        if image.isNull():
+            raise ProtocolError("capture_failed", "Krita returned an empty projection")
+        srgb = QColorSpace(QColorSpace.NamedColorSpace.SRgb)
+        if image.colorSpace().isValid() and image.colorSpace() != srgb:
+            image = image.convertedToColorSpace(srgb)
+        return image.convertToFormat(QImage.Format.Format_RGBA8888)
+
+    def _save_projection(
+        self,
+        document,
+        path_value: str,
+        bbox: list[int] | None = None,
+        max_side: int | None = None,
+    ) -> dict:
+        path = PATH_GUARD.resolve_write(path_value)
+        if path.suffix.lower() != ".png":
+            raise ProtocolError("invalid_format", "captures must use a .png path")
+        capture_pixels = (
+            bbox[2] * bbox[3] if bbox is not None else document.width() * document.height()
+        )
+        if capture_pixels > MAX_CAPTURE_PIXELS:
+            raise ProtocolError(
+                "capture_too_large",
+                f"capture exceeds the {MAX_CAPTURE_PIXELS}-pixel limit",
+            )
+        image = self._srgb8_projection(document, bbox)
+        if max_side is not None:
+            if not isinstance(max_side, int) or not 1 <= max_side <= 4096:
+                raise ProtocolError("invalid_capture", "max_side must be in [1, 4096]")
+            if max(image.width(), image.height()) > max_side:
+                image = image.scaled(
+                    max_side,
+                    max_side,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+        if not image.save(str(path), "PNG"):
+            raise ProtocolError("capture_failed", "Krita could not save the projection PNG")
+        return {"path": str(path), "width": image.width(), "height": image.height()}
+
+    def _begin_transaction(self, params: dict, envelope: dict) -> dict:
+        document_id, document = self._document(envelope)
+        target = self._node(document, params.get("target_layer_id"))
+        if target.type() != "paintlayer":
+            raise ProtocolError("invalid_transaction_target", "target layer must be a paint layer")
+        transaction_id = str(uuid.uuid4())
+        candidate = document.createNode(f"{TRANSACTION_PREFIX}{transaction_id}", "paintlayer")
+        parent = target.parentNode()
+        if parent is None or not parent.addChildNode(candidate, target):
+            raise ProtocolError("transaction_begin_failed", "could not attach candidate layer")
+        document.setActiveNode(candidate)
+        PROTOCOL_STATE.register_transaction(
+            transaction_id,
+            envelope["session_id"],
+            document_id,
+            candidate.uniqueId().toString(),
+        )
+        transaction = PROTOCOL_STATE.transactions[transaction_id]
+        transaction["target_layer_id"] = target.uniqueId().toString()
+        transaction["label"] = str(params.get("label") or "candidate")
+        document.refreshProjection()
+        return {
+            "document_id": document_id,
+            "transaction_id": transaction_id,
+            "candidate_layer_id": candidate.uniqueId().toString(),
+        }
+
+    def _transaction(self, params: dict, envelope: dict):
+        document_id, document = self._document(envelope)
+        transaction_id = params.get("transaction_id")
+        transaction = PROTOCOL_STATE.require_transaction(
+            transaction_id, envelope["session_id"], document_id
+        )
+        candidate = self._node(document, transaction["layer_id"])
+        if candidate.name() != f"{TRANSACTION_PREFIX}{transaction_id}":
+            raise ProtocolError("transaction_corrupt", "candidate layer identity changed")
+        return document_id, document, transaction_id, transaction, candidate
+
+    def _rollback_internal(self, transaction_id: str, document) -> None:
+        transaction = PROTOCOL_STATE.transactions.get(transaction_id)
+        if transaction is None:
+            return
+        candidate = document.nodeByUniqueID(QUuid(transaction["layer_id"]))
+        if candidate is not None:
+            candidate.remove()
+        PROTOCOL_STATE.finish_transaction(transaction_id)
+        document.refreshProjection()
+
+    def _paint_strokes(self, params: dict, envelope: dict) -> dict:
+        document_id, document, transaction_id, _transaction, candidate = self._transaction(
+            params, envelope
+        )
+        view = None
+        previous = None
+        results = []
+        trace_paths: list[Path] = []
+        try:
+            traced = bool(params.get("trace", False))
+            strokes = validate_strokes(params.get("strokes"), traced)
+            trace_directory = None
+            if traced:
+                raw_directory = Path(str(params.get("trace_directory") or ""))
+                sentinel = PATH_GUARD.resolve_write(raw_directory / ".trace-sentinel")
+                trace_directory = sentinel.parent
+            view = self._active_view()
+            previous = {
+                "preset": view.currentBrushPreset(),
+                "size": view.brushSize(),
+                "opacity": view.paintingOpacity(),
+                "flow": view.paintingFlow(),
+                "blend": view.currentBlendingMode(),
+                "eraser": view.eraserMode(),
+                "disable_pressure": view.disablePressure(),
+                "foreground": view.foregroundColor(),
+            }
+            for stroke in strokes:
+                result = self._paint_one(document, candidate, view, stroke)
+                if trace_directory is not None:
+                    trace_path = trace_directory / f"{stroke['stroke_id']}.png"
+                    capture = self._save_projection(
+                        document, str(trace_path), result["bbox"], None
+                    )
+                    result["trace_path"] = capture["path"]
+                    trace_paths.append(Path(capture["path"]))
+                results.append(result)
+        except Exception:
+            self._rollback_internal(transaction_id, document)
+            for path in trace_paths:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+            raise
+        finally:
+            if view is not None and previous is not None and previous["preset"] is not None:
+                view.setCurrentBrushPreset(previous["preset"])
+            if view is not None and previous is not None:
+                view.setBrushSize(previous["size"])
+                view.setPaintingOpacity(previous["opacity"])
+                view.setPaintingFlow(previous["flow"])
+                view.setCurrentBlendingMode(previous["blend"])
+                view.setEraserMode(previous["eraser"])
+                view.setDisablePressure(previous["disable_pressure"])
+                view.setForeGroundColor(previous["foreground"])
+        return {
+            "document_id": document_id,
+            "transaction_id": transaction_id,
+            "strokes": results,
+        }
+
+    def _commit_transaction(self, params: dict, envelope: dict) -> dict:
+        document_id, document, transaction_id, transaction, candidate = self._transaction(
+            params, envelope
+        )
+        mode = params.get("mode", "merge")
+        if mode == "merge":
+            replacement = candidate.mergeDown()
+            if replacement is None:
+                raise ProtocolError("transaction_commit_failed", "candidate mergeDown failed")
+            replacement_id = replacement.uniqueId().toString()
+        elif mode == "retain":
+            candidate.setName(str(params.get("name") or transaction.get("label") or "Candidate"))
+            replacement_id = candidate.uniqueId().toString()
+        else:
+            raise ProtocolError("invalid_commit_mode", "commit mode must be merge or retain")
+        PROTOCOL_STATE.finish_transaction(transaction_id)
+        document.refreshProjection()
+        return {
+            "document_id": document_id,
+            "transaction_id": transaction_id,
+            "replacement_node_id": replacement_id,
+            "mode": mode,
+        }
+
+    def _rollback_transaction(self, params: dict, envelope: dict) -> dict:
+        document_id, document, transaction_id, _transaction, _candidate = self._transaction(
+            params, envelope
+        )
+        self._rollback_internal(transaction_id, document)
+        return {
+            "document_id": document_id,
+            "transaction_id": transaction_id,
+            "rolled_back": True,
+        }
+
+    def _capture_region(self, params: dict, envelope: dict) -> dict:
+        document_id, document = self._document(envelope)
+        bbox = params.get("bbox")
+        if bbox is not None:
+            if (
+                not isinstance(bbox, list)
+                or len(bbox) != 4
+                or any(not isinstance(item, int) for item in bbox)
+                or bbox[2] <= 0
+                or bbox[3] <= 0
+            ):
+                raise ProtocolError("invalid_capture", "bbox must be [x, y, width, height]")
+        capture = self._save_projection(
+            document,
+            params.get("path", ""),
+            bbox,
+            params.get("max_side"),
+        )
+        return {"document_id": document_id, **capture}
+
+    def _render_brush_probe(self, params: dict, envelope: dict) -> dict:
+        document_id, document = self._document(envelope)
+        preset_id = params.get("preset_id")
+        size = float(params.get("size", 64.0))
+        layer = document.createNode(f"{TRANSACTION_PREFIX}probe-{uuid.uuid4()}", "paintlayer")
+        target = document.activeNode()
+        parent = target.parentNode() if target is not None else document.rootNode()
+        if not parent.addChildNode(layer, target):
+            raise ProtocolError("probe_failed", "could not attach probe layer")
+        view = self._active_view()
+        previous = {
+            "preset": view.currentBrushPreset(),
+            "size": view.brushSize(),
+            "opacity": view.paintingOpacity(),
+            "flow": view.paintingFlow(),
+            "blend": view.currentBlendingMode(),
+            "eraser": view.eraserMode(),
+            "disable_pressure": view.disablePressure(),
+            "foreground": view.foregroundColor(),
+        }
+        try:
+            width, height = document.width(), document.height()
+            margin = max(8.0, size)
+            results = []
+            for index, pressure in enumerate((0.2, 0.4, 0.6, 0.8, 1.0)):
+                y = margin + index * max(size * 1.5, 24.0)
+                stroke = {
+                    "stroke_id": f"probe-{index}",
+                    "preset_id": preset_id,
+                    "size": size,
+                    "opacity": 1.0,
+                    "flow": 1.0,
+                    "blend_mode": "normal",
+                    "foreground_rgba": [20, 20, 20, 255],
+                    "erase": False,
+                    "geometry": {
+                        "type": "line",
+                        "start": [margin, min(height - margin, y)],
+                        "end": [max(margin, width - margin), min(height - margin, y)],
+                    },
+                    "pressure": {"start": pressure, "end": pressure},
+                }
+                results.append(self._paint_one(document, layer, view, stroke))
+            capture = self._save_projection(
+                document, params.get("path", ""), None, params.get("max_side", 1280)
+            )
+        finally:
+            layer.remove()
+            document.refreshProjection()
+            if previous["preset"] is not None:
+                view.setCurrentBrushPreset(previous["preset"])
+            view.setBrushSize(previous["size"])
+            view.setPaintingOpacity(previous["opacity"])
+            view.setPaintingFlow(previous["flow"])
+            view.setCurrentBlendingMode(previous["blend"])
+            view.setEraserMode(previous["eraser"])
+            view.setDisablePressure(previous["disable_pressure"])
+            view.setForeGroundColor(previous["foreground"])
+        return {
+            "document_id": document_id,
+            "preset_id": preset_id,
+            "probe_strokes": results,
+            **capture,
+        }
 
 
-# Register the extension
 Krita.instance().addExtension(KritaMCPExtension(Krita.instance()))
