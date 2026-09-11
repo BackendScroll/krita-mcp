@@ -16,6 +16,7 @@ import struct
 import tempfile
 import threading
 import time
+import traceback
 import uuid
 
 from krita import Extension, InfoObject, Krita, ManagedColor, Selection
@@ -66,6 +67,37 @@ TRACE_ROOT = Path(
     )
 ).expanduser()
 TRACE_ROOT.mkdir(parents=True, exist_ok=True)
+
+# Unhandled action errors are sanitised before they reach the client, so
+# without this the real traceback is lost and every fault looks like an opaque
+# "internal_error". Overridable, and never allowed to raise.
+ERROR_LOG_PATH = Path(
+    os.environ.get("KRITA_MCP_ERROR_LOG", str(TRACE_ROOT / "kritamcp-errors.log"))
+).expanduser()
+
+
+def log_unhandled_error(request_id, action) -> None:
+    try:
+        ERROR_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with ERROR_LOG_PATH.open("a", encoding="utf-8") as stream:
+            stream.write(
+                "=== %s request_id=%s action=%s ===\n"
+                % (time.strftime("%Y-%m-%dT%H:%M:%S"), request_id, action)
+            )
+            traceback.print_exc(file=stream)
+            stream.write("\n")
+    except Exception:
+        pass
+
+
+def log_event(message: str) -> None:
+    """Append a diagnostic line to the same log as unhandled errors."""
+    try:
+        ERROR_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with ERROR_LOG_PATH.open("a", encoding="utf-8") as stream:
+            stream.write("=== %s %s\n" % (time.strftime("%Y-%m-%dT%H:%M:%S"), message))
+    except Exception:
+        pass
 
 TOKEN = ensure_token(TOKEN_PATH)
 PATH_GUARD = PathGuard([ASSET_ROOT, TRACE_ROOT], [ASSET_ROOT, TRACE_ROOT])
@@ -163,6 +195,12 @@ class _LoopbackHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
+    def handle_error(self, request, client_address) -> None:
+        # The default implementation prints the traceback to stderr, which is
+        # invisible inside a running Krita. Route per-connection failures to
+        # the same log as handler failures so they stop being silent.
+        log_unhandled_error(None, "connection:%s" % (client_address,))
+
 
 class V4RequestHandler(BaseHTTPRequestHandler):
     """Strict HTTP surface: /health plus authenticated /v4 endpoints."""
@@ -244,16 +282,57 @@ class V4RequestHandler(BaseHTTPRequestHandler):
 
 
 class ServerThread(QThread):
+    """Owns the accept loop, and must outlive any single failure inside it."""
+
     def __init__(self, port: int) -> None:
         super().__init__()
         self.port = port
         self.server: _LoopbackHTTPServer | None = None
+        self._stopping = False
+        self.restarts = 0
 
     def run(self) -> None:
-        self.server = _LoopbackHTTPServer((SERVER_HOST, self.port), V4RequestHandler)
-        self.server.serve_forever(poll_interval=0.25)
+        # An exception escaping serve_forever() ends this thread while the
+        # listening socket stays bound, and that failure is invisible from
+        # outside: the process is still alive, the socket is still in LISTEN,
+        # but nothing ever calls accept() again, so client connections sit
+        # unanswered in the accept queue (Recv-Q > 0) until they time out.
+        # Nothing is written anywhere either -- the action-level error log
+        # only covers command dispatch, not the serve loop -- which is why
+        # this looked like a wedged Krita rather than a dead accept loop.
+        #
+        # Supervise it: every exit is logged, and a failed loop is rebuilt
+        # rather than left dead.
+        backoff = 0.5
+        while not self._stopping:
+            try:
+                if self.server is None:
+                    self.server = _LoopbackHTTPServer(
+                        (SERVER_HOST, self.port), V4RequestHandler
+                    )
+                self.server.serve_forever(poll_interval=0.25)
+                if self._stopping:
+                    return
+                log_event("serve loop returned without a stop request")
+            except Exception:
+                log_unhandled_error(None, "serve_forever")
+            if self._stopping:
+                return
+            self.restarts += 1
+            log_event(
+                "accept loop died; rebuilding listener (restart #%d)" % self.restarts
+            )
+            try:
+                if self.server is not None:
+                    self.server.server_close()
+            except Exception:
+                pass
+            self.server = None
+            time.sleep(backoff)
+            backoff = min(backoff * 2.0, 10.0)
 
     def stop(self) -> None:
+        self._stopping = True
         if self.server is not None:
             self.server.shutdown()
             self.server.server_close()
@@ -269,8 +348,13 @@ class KritaMCPExtension(Extension):
         self._documents: dict[str, object] = {}
         self._document_ids: dict[int, str] = {}
         self._brushes: dict[str, object] = {}
+        # Guards process_commands against re-entry from a nested Qt event
+        # loop spun by a Krita operation already running on the main thread.
+        self._draining = False
+        self._reentry_deferred = 0
 
     def setup(self) -> None:
+        Krita.instance().setBatchmode(True)
         return
 
     def createActions(self, _window) -> None:
@@ -284,11 +368,37 @@ class KritaMCPExtension(Extension):
             self.timer.start(20)
 
     def process_commands(self) -> None:
-        item = COMMAND_QUEUE.pop()
-        if item is None:
+        # Krita's main-thread operations (waitForDone, refreshProjection, and
+        # action.trigger for merge/flatten) pump the Qt event loop so the
+        # status bar stays live -- that is what draws the "script ... is
+        # working" progress bar. Pumping re-enters this 20 ms timer slot while
+        # the outer command is still mid-flight. Without a guard the drain
+        # then starts a SECOND brush operation on the same document from
+        # inside the first one's wait, the stroke scheduler deadlocks, and the
+        # main thread never returns. Because that thread holds the GIL, the
+        # HTTP ServerThread cannot run either, so accept() stops and the
+        # listening socket accumulates Recv-Q with the process still alive --
+        # exactly the observed stall.
+        #
+        # One command at a time on the main thread. Deferred work is not lost:
+        # the timer fires again every 20 ms once the outer command returns.
+        if self._draining:
+            self._reentry_deferred += 1
+            if self._reentry_deferred in (1, 10, 100, 1000):
+                log_event(
+                    "reentrancy: nested event loop re-entered process_commands; "
+                    "deferred=%d (this is the guard working)" % self._reentry_deferred
+                )
             return
-        queue_id, envelope = item
-        COMMAND_QUEUE.set_result(queue_id, self.execute_envelope(envelope))
+        self._draining = True
+        try:
+            item = COMMAND_QUEUE.pop()
+            if item is None:
+                return
+            queue_id, envelope = item
+            COMMAND_QUEUE.set_result(queue_id, self.execute_envelope(envelope))
+        finally:
+            self._draining = False
 
     def execute_envelope(self, envelope: dict) -> dict:
         request_id = envelope.get("request_id")
@@ -300,6 +410,7 @@ class KritaMCPExtension(Extension):
         except ProtocolError as error:
             return error_response(request_id, error)
         except Exception:
+            log_unhandled_error(request_id, envelope.get("action"))
             return error_response(
                 request_id,
                 ProtocolError(
@@ -323,6 +434,7 @@ class KritaMCPExtension(Extension):
             "create_layer": self._create_layer,
             "update_layer": self._update_layer,
             "delete_layer": self._delete_layer,
+            "flatten_layer": self._flatten_layer,
             "set_selection_from_mask": self._set_selection_from_mask,
             "clear_selection": self._clear_selection,
             "list_brushes": self._list_brushes,
@@ -512,6 +624,12 @@ class KritaMCPExtension(Extension):
             int(state["resolution_ppi"]),
         )
         if actual != expected:
+            # _fill_u16 above dirtied the document, and close() on a modified
+            # document blocks forever on Krita's native "save changes?" dialog
+            # (batch mode does not suppress it in this build). Clearing the
+            # dirty flag first is what keeps this error path from hanging the
+            # main thread instead of returning the invariant failure.
+            document.setModified(False)
             document.close()
             self._forget_document(document_id)
             raise ProtocolError(
@@ -572,6 +690,10 @@ class KritaMCPExtension(Extension):
         for transaction_id, transaction in list(PROTOCOL_STATE.transactions.items()):
             if transaction["document_id"] == document_id:
                 self._rollback_internal(transaction_id, document)
+        # document.close() blocks forever on Krita's native "save changes?"
+        # dialog for a modified document; batch mode alone does not suppress
+        # it in this Krita build, so the dirty flag must be cleared first.
+        document.setModified(False)
         if not document.close():
             raise ProtocolError("close_failed", "Krita refused to close the document")
         self._forget_document(document_id)
@@ -658,6 +780,41 @@ class KritaMCPExtension(Extension):
             raise ProtocolError("layer_delete_failed", "Krita could not delete the layer")
         document.refreshProjection()
         return {"document_id": document_id, "deleted_node_id": node_id}
+
+    def _flatten_layer(self, params: dict, envelope: dict) -> dict:
+        """Collapse a group into a single paint layer, preserving its name.
+
+        Krita exposes no Node-level flatten, and Node.mergeDown() is unreliable
+        for nested layers in this build, so this drives the application's own
+        flatten_layer action against the active node.
+        """
+        document_id, document = self._document(envelope)
+        node = self._node(document, params.get("node_id"))
+        if node.name().startswith(TRANSACTION_PREFIX):
+            raise ProtocolError(
+                "transaction_required", "plugin-owned candidate layers cannot be flattened"
+            )
+        name = node.name()
+        document.setActiveNode(node)
+        document.waitForDone()
+        action = self._app().action("flatten_layer")
+        if action is None:
+            raise ProtocolError("flatten_failed", "flatten_layer action unavailable")
+        action.trigger()
+        document.waitForDone()
+        replacement = document.activeNode()
+        if replacement is None:
+            raise ProtocolError("flatten_failed", "Krita did not return a flattened layer")
+        # Flattening discards the group's name in some builds; restore it so
+        # semantic ordering survives the collapse.
+        if replacement.name() != name:
+            replacement.setName(name)
+        document.refreshProjection()
+        return {
+            "document_id": document_id,
+            "node_id": replacement.uniqueId().toString(),
+            "name": replacement.name(),
+        }
 
     @staticmethod
     def _image_bytes(image: QImage) -> bytes:
@@ -810,18 +967,60 @@ class KritaMCPExtension(Extension):
         bottom = min(document.height(), int(max(point[1] for point in points) + padding) + 1)
         return [left, top, max(0, right - left), max(0, bottom - top)]
 
+    # None until probed; then True if this Krita build's paintLine takes
+    # QPoint (5.2-style bindings) rather than QPointF (master). The endpoint
+    # type genuinely differs between builds, so it is detected once at
+    # runtime instead of being hardcoded.
+    _paint_line_uses_qpoint = None
+
+    def _paint_line(self, layer, start, end, pressure_start, pressure_end):
+        """One paintLine call, tolerant of both endpoint signatures.
+
+        The probe raises before painting anything, so a failed attempt cannot
+        leave a partial stroke behind.
+        """
+        if self._paint_line_uses_qpoint is None:
+            try:
+                layer.paintLine(
+                    QPointF(*start),
+                    QPointF(*end),
+                    pressure_start,
+                    pressure_end,
+                    "ForegroundColor",
+                )
+                KritaMCPExtension._paint_line_uses_qpoint = False
+                return
+            except TypeError:
+                KritaMCPExtension._paint_line_uses_qpoint = True
+        if self._paint_line_uses_qpoint:
+            layer.paintLine(
+                QPointF(*start).toPoint(),
+                QPointF(*end).toPoint(),
+                pressure_start,
+                pressure_end,
+                "ForegroundColor",
+            )
+        else:
+            layer.paintLine(
+                QPointF(*start),
+                QPointF(*end),
+                pressure_start,
+                pressure_end,
+                "ForegroundColor",
+            )
+
     def _paint_one(self, document, layer, view, stroke: dict) -> dict:
         resource = self._apply_stroke_settings(view, stroke)
         geometry = stroke["geometry"]
         start_time = time.perf_counter()
         if geometry["type"] == "line":
             view.setDisablePressure(False)
-            layer.paintLine(
-                QPointF(*geometry["start"]),
-                QPointF(*geometry["end"]),
+            self._paint_line(
+                layer,
+                geometry["start"],
+                geometry["end"],
                 float(stroke["pressure"]["start"]),
                 float(stroke["pressure"]["end"]),
-                "ForegroundColor",
             )
         else:
             view.setDisablePressure(True)
@@ -1007,8 +1206,22 @@ class KritaMCPExtension(Extension):
         )
         mode = params.get("mode", "merge")
         if mode == "merge":
-            replacement = candidate.mergeDown()
-            if replacement is None:
+            # Node.mergeDown() reliably returns None for a candidate nested
+            # inside a semantic group in this Krita build, even though the
+            # layer stack is structurally normal. Triggering Krita's own
+            # merge_layer action operates on the same active-node context
+            # through the application's real merge pipeline and succeeds
+            # where the low-level Node API does not.
+            document.refreshProjection()
+            document.waitForDone()
+            document.setActiveNode(candidate)
+            action = self._app().action("merge_layer")
+            if action is None:
+                raise ProtocolError("transaction_commit_failed", "merge_layer action unavailable")
+            action.trigger()
+            document.waitForDone()
+            replacement = document.activeNode()
+            if replacement is None or replacement.name().startswith(TRANSACTION_PREFIX):
                 raise ProtocolError("transaction_commit_failed", "candidate mergeDown failed")
             replacement_id = replacement.uniqueId().toString()
         elif mode == "retain":
@@ -1099,8 +1312,10 @@ class KritaMCPExtension(Extension):
                     "pressure": {"start": pressure, "end": pressure},
                 }
                 results.append(self._paint_one(document, layer, view, stroke))
+            # document.projection() with no bbox returns a null QImage in
+            # this Krita build; an explicit full-canvas rect works correctly.
             capture = self._save_projection(
-                document, params.get("path", ""), None, params.get("max_side", 1280)
+                document, params.get("path", ""), [0, 0, width, height], params.get("max_side", 1280)
             )
         finally:
             layer.remove()

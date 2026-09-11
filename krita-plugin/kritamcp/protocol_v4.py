@@ -45,6 +45,7 @@ WRITE_ACTIONS = frozenset(
         "create_layer",
         "update_layer",
         "delete_layer",
+        "flatten_layer",
         "set_selection_from_mask",
         "clear_selection",
         "render_brush_probe",
@@ -563,6 +564,7 @@ class ProtocolState:
 
                 self.obtain_writer(session_id)
                 if request["expected_revision"] != self.revision:
+                    self.release_session(session_id)
                     raise ProtocolError(
                         "revision_conflict",
                         "expected_revision does not match the bridge revision",
@@ -574,8 +576,18 @@ class ProtocolState:
                         http_status=409,
                     )
 
-            result = execute(request["action"], request["params"])
+            # A failed mutating action must not leave the writer lease held
+            # for the full session timeout; release it so a retry does not
+            # spuriously collide with the dead session.
+            try:
+                result = execute(request["action"], request["params"])
+            except Exception:
+                if mutating:
+                    self.release_session(session_id)
+                raise
             if not isinstance(result, dict):
+                if mutating:
+                    self.release_session(session_id)
                 raise ProtocolError(
                     "internal_error",
                     "bridge action returned an invalid result",
