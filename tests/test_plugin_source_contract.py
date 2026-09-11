@@ -176,6 +176,21 @@ class PluginSourceContractTests(unittest.TestCase):
         )
         self.assertIn('transaction["was_modified"] = was_modified', self.source)
 
+    def test_dirty_flag_is_restored_after_the_async_work_is_flushed(self):
+        # remove()/refreshProjection() are asynchronous: the scheduler
+        # re-marks the document dirty after the call returns, so a
+        # setModified() that is not preceded by waitForDone() lands too early
+        # and is silently undone. Measured: without the flush the document
+        # still read modified=True on the very next command.
+        for name in ("_render_brush_probe", "_rollback_internal"):
+            calls = self._called_attributes(self._function(name))
+            self.assertIn("waitForDone", calls, f"{name} must flush async work")
+            self.assertLess(
+                calls.index("waitForDone"),
+                calls.index("setModified"),
+                f"{name} must flush before restoring the dirty flag",
+            )
+
     def test_commit_does_not_clear_the_dirty_flag(self):
         # Committing a transaction is a real edit and must leave the document
         # dirty; only the content-neutral paths restore the flag.

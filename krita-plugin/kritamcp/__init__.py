@@ -1143,6 +1143,9 @@ class KritaMCPExtension(Extension):
         was_modified = transaction.get("was_modified")
         PROTOCOL_STATE.finish_transaction(transaction_id)
         document.refreshProjection()
+        # Flush the async candidate removal before restoring the flag below,
+        # or the scheduler re-dirties the document after we have cleared it.
+        document.waitForDone()
         # A rollback restores the document's content, so it must restore the
         # dirty flag too -- otherwise an abandoned transaction leaves a canvas
         # that prompts "save changes?" despite nothing having changed. Commit
@@ -1339,6 +1342,12 @@ class KritaMCPExtension(Extension):
         finally:
             layer.remove()
             document.refreshProjection()
+            # remove() and refreshProjection() are asynchronous: the image
+            # scheduler finishes the removal and re-marks the document dirty
+            # *after* the call returns. Without this flush, the setModified
+            # below lands too early and is immediately undone -- measured, the
+            # document still read modified=True on the next command.
+            document.waitForDone()
             if previous["preset"] is not None:
                 view.setCurrentBrushPreset(previous["preset"])
             view.setBrushSize(previous["size"])
