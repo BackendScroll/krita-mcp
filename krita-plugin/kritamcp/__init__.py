@@ -1092,6 +1092,10 @@ class KritaMCPExtension(Extension):
 
     def _begin_transaction(self, params: dict, envelope: dict) -> dict:
         document_id, document = self._document(envelope)
+        # Captured before the candidate layer exists, so a rollback can restore
+        # the dirty flag to its true pre-transaction value. Read it here rather
+        # than at rollback time, when the candidate has already dirtied it.
+        was_modified = document.modified()
         target = self._node(document, params.get("target_layer_id"))
         if target.type() != "paintlayer":
             raise ProtocolError("invalid_transaction_target", "target layer must be a paint layer")
@@ -1110,6 +1114,7 @@ class KritaMCPExtension(Extension):
         transaction = PROTOCOL_STATE.transactions[transaction_id]
         transaction["target_layer_id"] = target.uniqueId().toString()
         transaction["label"] = str(params.get("label") or "candidate")
+        transaction["was_modified"] = was_modified
         document.refreshProjection()
         return {
             "document_id": document_id,
@@ -1135,8 +1140,15 @@ class KritaMCPExtension(Extension):
         candidate = document.nodeByUniqueID(QUuid(transaction["layer_id"]))
         if candidate is not None:
             candidate.remove()
+        was_modified = transaction.get("was_modified")
         PROTOCOL_STATE.finish_transaction(transaction_id)
         document.refreshProjection()
+        # A rollback restores the document's content, so it must restore the
+        # dirty flag too -- otherwise an abandoned transaction leaves a canvas
+        # that prompts "save changes?" despite nothing having changed. Commit
+        # deliberately does not do this: a commit is a real edit.
+        if was_modified is not None:
+            document.setModified(was_modified)
 
     def _paint_strokes(self, params: dict, envelope: dict) -> dict:
         document_id, document, transaction_id, _transaction, candidate = self._transaction(
@@ -1271,6 +1283,13 @@ class KritaMCPExtension(Extension):
 
     def _render_brush_probe(self, params: dict, envelope: dict) -> dict:
         document_id, document = self._document(envelope)
+        # A probe adds a layer, paints into it, captures, and removes it again,
+        # so it leaves the document content-identical -- but Krita still marks
+        # it dirty. Calibration runs ~144 of these against whatever document is
+        # active, which is how a canvas nobody edited ends up prompting "save
+        # changes?" on close. Restore whatever the flag was on entry; real user
+        # edits made before the probe are preserved by capturing, not clearing.
+        was_modified = document.modified()
         preset_id = params.get("preset_id")
         size = float(params.get("size", 64.0))
         layer = document.createNode(f"{TRANSACTION_PREFIX}probe-{uuid.uuid4()}", "paintlayer")
@@ -1329,6 +1348,8 @@ class KritaMCPExtension(Extension):
             view.setEraserMode(previous["eraser"])
             view.setDisablePressure(previous["disable_pressure"])
             view.setForeGroundColor(previous["foreground"])
+            # Last, so nothing above can re-dirty the document.
+            document.setModified(was_modified)
         return {
             "document_id": document_id,
             "preset_id": preset_id,

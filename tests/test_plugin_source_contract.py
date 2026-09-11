@@ -145,6 +145,45 @@ class PluginSourceContractTests(unittest.TestCase):
         )
         self.assertIn("_draining", self.source)
 
+    def test_content_neutral_operations_restore_the_dirty_flag(self):
+        # A probe adds a layer, paints, captures and removes it; a rollback
+        # discards its candidate. Both leave the document content-identical,
+        # but Krita still marks it dirty, so a canvas nobody edited prompts
+        # "save changes?" on close -- and calibration runs ~144 probes against
+        # whatever document is active.
+        probe = self._function("_render_brush_probe")
+        self.assertIn(
+            "modified",
+            self._called_attributes(probe),
+            "the probe must read the dirty flag before touching the document",
+        )
+        self.assertIn(
+            "setModified",
+            self._called_attributes(probe),
+            "the probe must restore the dirty flag it found",
+        )
+        rollback = self._function("_rollback_internal")
+        self.assertIn(
+            "setModified",
+            self._called_attributes(rollback),
+            "a rollback must restore the pre-transaction dirty flag",
+        )
+        # The pre-transaction value has to be captured at begin time, before a
+        # candidate layer exists to dirty it.
+        self.assertIn(
+            "modified",
+            self._called_attributes(self._function("_begin_transaction")),
+        )
+        self.assertIn('transaction["was_modified"] = was_modified', self.source)
+
+    def test_commit_does_not_clear_the_dirty_flag(self):
+        # Committing a transaction is a real edit and must leave the document
+        # dirty; only the content-neutral paths restore the flag.
+        self.assertNotIn(
+            "setModified",
+            self._called_attributes(self._function("_commit_transaction")),
+        )
+
     def test_save_export_and_projection_are_distinct(self):
         self.assertIn("document.saveAs", self.source)
         self.assertIn("document.save()", self.source)
