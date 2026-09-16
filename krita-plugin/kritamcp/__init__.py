@@ -533,6 +533,11 @@ class KritaMCPExtension(Extension):
         return result
 
     def _get_state(self, _params: dict, envelope: dict) -> dict:
+        # Lease expiry is lazy (it runs inside obtain_writer), so a raw read of
+        # writer_session reports True forever after any session has held the
+        # lease — even long past the 120 s timeout. Expire before reporting.
+        with PROTOCOL_STATE._lock:
+            PROTOCOL_STATE._expire_writer()
         result = {
             "bridge_revision": PROTOCOL_STATE.revision,
             "writer_lease": PROTOCOL_STATE.writer_session is not None,
@@ -1032,7 +1037,14 @@ class KritaMCPExtension(Extension):
                     QPointF(*command["end"]),
                 )
             layer.paintPath(path, "ForegroundColor", "None")
-        document.refreshProjection()
+        # NOTE: no document.refreshProjection() here. The projection is only
+        # needed for trace captures (the bbox above is pure geometry), and
+        # refreshProjection blocks in KisImage::waitForDone, which pops a
+        # MODAL busy-wait dialog whose nested event loop eats every timer
+        # event: accept() starves and the bridge stalls (Recv-Q > 0) — the
+        # live stall captured by py-spy on 2026-09-16. Per-stroke refreshes
+        # in the hot loop multiplied that exposure thousands-fold; trace
+        # captures refresh explicitly just before the capture instead.
         elapsed_ms = int((time.perf_counter() - start_time) * 1000)
         filename = resource.filename() or None
         return {
@@ -1183,6 +1195,10 @@ class KritaMCPExtension(Extension):
             for stroke in strokes:
                 result = self._paint_one(document, candidate, view, stroke)
                 if trace_directory is not None:
+                    # The crop must reflect this stroke, so refresh once per
+                    # traced stroke. Refreshing here (not in _paint_one) keeps
+                    # untraced painting runs free of waitForDone entirely.
+                    document.refreshProjection()
                     trace_path = trace_directory / f"{stroke['stroke_id']}.png"
                     capture = self._save_projection(
                         document, str(trace_path), result["bbox"], None

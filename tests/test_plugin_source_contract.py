@@ -209,3 +209,61 @@ class PluginSourceContractTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RefreshProjectionContractTests(unittest.TestCase):
+    """refreshProjection blocks in KisImage::waitForDone, which pops a modal
+    busy-wait dialog whose nested event loop starves accept() (the live stall
+    captured with py-spy on 2026-09-16). The stroke hot loop must therefore
+    never call it; only trace captures, which genuinely need a current
+    projection, may."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.source = SOURCE_PATH.read_text(encoding="utf-8")
+        cls.tree = ast.parse(cls.source)
+
+    def _function(self, name):
+        return next(
+            node
+            for node in ast.walk(self.tree)
+            if isinstance(node, ast.FunctionDef) and node.name == name
+        )
+
+    @staticmethod
+    def _called_attributes(node):
+        return [
+            child.func.attr
+            for child in ast.walk(node)
+            if isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute)
+        ]
+
+    def test_paint_one_does_not_refresh_the_projection(self):
+        self.assertNotIn(
+            "refreshProjection",
+            self._called_attributes(self._function("_paint_one")),
+            "_paint_one sits in the stroke hot loop; a per-stroke "
+            "refreshProjection multiplies the modal-wait deadlock exposure "
+            "thousands-fold",
+        )
+
+    def test_traced_strokes_refresh_before_capture(self):
+        func = self._function("_paint_strokes")
+        trace_branches = [
+            node
+            for node in ast.walk(func)
+            if isinstance(node, ast.If)
+            and "trace_directory" in ast.dump(node.test)
+            and "None" in ast.dump(node.test)
+        ]
+        self.assertTrue(trace_branches, "the trace branch must exist")
+        refreshed = any(
+            "refreshProjection" in self._called_attributes(node)
+            for branch in trace_branches
+            for node in ast.walk(branch)
+        )
+        self.assertTrue(
+            refreshed,
+            "trace crops must refresh the projection before capture, "
+            "inside the trace branch",
+        )
