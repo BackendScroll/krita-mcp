@@ -1236,13 +1236,35 @@ class KritaMCPExtension(Extension):
             for stroke in strokes:
                 result = self._paint_one(document, candidate, view, stroke)
                 if trace_directory is not None:
-                    # NO refreshProjection() here. Refreshing once per traced
-                    # stroke is what starved the bridge's accept loop (Recv-Q
-                    # climbing while the main thread sat idle in do_sys_poll).
-                    # _save_projection below reads the projection directly; a
-                    # trace may lag by a stroke, which is acceptable for an
-                    # animation frame. Correctness-critical captures go through
-                    # _capture_region, which refreshes explicitly.
+                    # Restored 2026-09-17 (removed earlier the same night).
+                    # Without this, _save_projection below reads a stale
+                    # projection: a meaningful fraction of trace crops came
+                    # back showing no stroke mark at all (std=0.00, perfectly
+                    # uniform colour -- measured live on run
+                    # 20260916T220226Z), and the accumulated composite
+                    # diverged from preview.png enough to fail
+                    # build_stroke_gif's SSIM >= 0.98 gate on an otherwise
+                    # fully-painted, 8-phase run.
+                    #
+                    # The earlier removal traded that correctness for safety
+                    # against the accept-loop starvation this same refresh
+                    # caused during the 2026-09-16 wedge investigation -- but
+                    # that investigation's root cause was a MODAL DIALOG
+                    # (confirmed by the user watching Krita: the PNG export
+                    # options dialog), not refreshProjection() itself. A
+                    # dialog's nested event loop is what starves accept();
+                    # this refresh only starves it if something is blocking
+                    # behind a dialog while it runs. Two of that condition's
+                    # known triggers are now closed: stop_krita clears
+                    # ~/.krita-*-autosave.kra (autopainter/services.py), so
+                    # the autosave-recovery dialog should not be armed, and
+                    # every document now enters batch mode at registration
+                    # (see _register_document), which is what the export
+                    # dialog was actually missing. If Recv-Q climbs again
+                    # with this restored, that is new evidence a THIRD dialog
+                    # trigger exists -- capture it via py-spy/eu-stack rather
+                    # than re-removing this blind.
+                    document.refreshProjection()
                     trace_path = trace_directory / f"{stroke['stroke_id']}.png"
                     capture = self._save_projection(
                         document, str(trace_path), result["bbox"], None

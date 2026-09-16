@@ -269,21 +269,45 @@ class RefreshProjectionContractTests(unittest.TestCase):
             "thousands-fold",
         )
 
-    def test_traced_strokes_do_not_refresh_in_the_stroke_loop(self):
-        """Inverted 2026-09-16. The per-traced-stroke refreshProjection() was
-        the accept-loop starver: Recv-Q climbed on :5678 while Krita's main
-        thread sat idle in do_sys_poll at 0.0% CPU, and the bridge answered
-        nothing until Krita was restarted. A trace may now lag by one stroke,
-        which is fine for an animation frame. Correctness-critical captures go
-        through _capture_region, which refreshes explicitly -- pinned by
-        test_capture_region_refreshes_before_saving below.
+    def test_traced_strokes_refresh_before_capture(self):
+        """Re-inverted 2026-09-17, same night as the removal above.
+
+        Without the refresh, a meaningful fraction of trace crops came back
+        showing no stroke mark at all (std=0.00, perfectly uniform colour --
+        measured on run 20260916T220226Z), and the accumulated composite
+        diverged from preview.png enough to fail build_stroke_gif's SSIM >=
+        0.98 gate on an otherwise fully-painted, 8-phase run.
+
+        The 2026-09-16 removal was correct given what was known then, but
+        the accept-loop starvation it was defending against turned out to
+        have a different root cause: a MODAL DIALOG (the PNG export options
+        dialog, confirmed by the user watching Krita), not this call by
+        itself. Two of that dialog's known triggers are closed independently
+        -- stop_krita clears ~/.krita-*-autosave.kra
+        (autopainter/services.py), and every document now enters batch mode
+        at registration (test_documents_enter_batch_mode below) -- so the
+        refresh is restored. If Recv-Q climbs again with this in place, that
+        is new evidence a third dialog trigger exists; capture it with
+        py-spy/eu-stack before removing this a second time.
         """
         func = self._function("_paint_strokes")
-        self.assertNotIn(
-            "refreshProjection",
-            self._called_attributes(func),
-            "_paint_strokes runs once per stroke; refreshing here starves the "
-            "HTTP accept loop",
+        trace_branches = [
+            node
+            for node in ast.walk(func)
+            if isinstance(node, ast.If)
+            and "trace_directory" in ast.dump(node.test)
+            and "None" in ast.dump(node.test)
+        ]
+        self.assertTrue(trace_branches, "the trace branch must exist")
+        refreshed = any(
+            "refreshProjection" in self._called_attributes(node)
+            for branch in trace_branches
+            for node in ast.walk(branch)
+        )
+        self.assertTrue(
+            refreshed,
+            "trace crops must refresh the projection before capture, "
+            "inside the trace branch",
         )
 
     def test_capture_region_refreshes_before_saving(self):
