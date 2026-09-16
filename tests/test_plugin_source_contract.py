@@ -163,13 +163,17 @@ class PluginSourceContractTests(unittest.TestCase):
             "the probe must restore the dirty flag it found",
         )
         rollback = self._function("_rollback_internal")
-        self.assertIn(
+        self.assertNotIn(
             "setModified",
             self._called_attributes(rollback),
-            "a rollback must restore the pre-transaction dirty flag",
+            "a rollback must NOT restore the dirty flag: the restore shipped"
+            " twice and failed live both times (runbook OPEN item), and the"
+            " flush+restore dance is where the bridge wedges (see"
+            " test_rollback_must_not_block). A rollback is an abort path on a"
+            " document that is genuinely dirty afterwards.",
         )
-        # The pre-transaction value has to be captured at begin time, before a
-        # candidate layer exists to dirty it.
+        # The probe keeps its capture-and-restore: it must leave a canvas"
+        # nobody edited unmodified.
         self.assertIn(
             "modified",
             self._called_attributes(self._function("_begin_transaction")),
@@ -182,14 +186,16 @@ class PluginSourceContractTests(unittest.TestCase):
         # setModified() that is not preceded by waitForDone() lands too early
         # and is silently undone. Measured: without the flush the document
         # still read modified=True on the very next command.
-        for name in ("_render_brush_probe", "_rollback_internal"):
-            calls = self._called_attributes(self._function(name))
-            self.assertIn("waitForDone", calls, f"{name} must flush async work")
-            self.assertLess(
-                calls.index("waitForDone"),
-                calls.index("setModified"),
-                f"{name} must flush before restoring the dirty flag",
-            )
+        #
+        # ROLLBACK IS THE EXCEPTION: it must not block at all -- see
+        # test_rollback_must_not_block. The probe keeps the flush+restore.
+        calls = self._called_attributes(self._function("_render_brush_probe"))
+        self.assertIn("waitForDone", calls, "the probe must flush async work")
+        self.assertLess(
+            calls.index("waitForDone"),
+            calls.index("setModified"),
+            "the probe must flush before restoring the dirty flag",
+        )
 
     def test_commit_does_not_clear_the_dirty_flag(self):
         # Committing a transaction is a real edit and must leave the document
@@ -198,6 +204,18 @@ class PluginSourceContractTests(unittest.TestCase):
             "setModified",
             self._called_attributes(self._function("_commit_transaction")),
         )
+
+    def test_rollback_must_not_block(self):
+        # 2026-09-16, proven with py-spy --native and a full eu-stack dump:
+        # rollback's refreshProjection() + waitForDone() sat on the Krita main
+        # thread inside KisImage::waitForDone while every projection-update
+        # worker blocked in QReadWriteLock::lockForRead with no writer -- the
+        # modal busy-wait dialog starved the bridge accept loop and the run
+        # wedged three times in a row, always at rollback. A rollback is an
+        # abort path: it may remove the candidate and return, nothing more.
+        rollback = self._function("_rollback_internal")
+        self.assertNotIn("refreshProjection", self._called_attributes(rollback))
+        self.assertNotIn("waitForDone", self._called_attributes(rollback))
 
     def test_save_export_and_projection_are_distinct(self):
         self.assertIn("document.saveAs", self.source)

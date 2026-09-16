@@ -1152,18 +1152,18 @@ class KritaMCPExtension(Extension):
         candidate = document.nodeByUniqueID(QUuid(transaction["layer_id"]))
         if candidate is not None:
             candidate.remove()
-        was_modified = transaction.get("was_modified")
         PROTOCOL_STATE.finish_transaction(transaction_id)
-        document.refreshProjection()
-        # Flush the async candidate removal before restoring the flag below,
-        # or the scheduler re-dirties the document after we have cleared it.
-        document.waitForDone()
-        # A rollback restores the document's content, so it must restore the
-        # dirty flag too -- otherwise an abandoned transaction leaves a canvas
-        # that prompts "save changes?" despite nothing having changed. Commit
-        # deliberately does not do this: a commit is a real edit.
-        if was_modified is not None:
-            document.setModified(was_modified)
+        # Deliberately NON-BLOCKING. Earlier revisions called
+        # refreshProjection() + waitForDone() here (and then tried to restore
+        # the document dirty flag, a restore that never worked live -- see the
+        # runbook OPEN item). Both blocking calls sit on the Krita main thread
+        # inside KisImage::waitForDone, which is where the 2026-09-16 wedges
+        # (eu-stack: all projection-update workers blocked in
+        # QReadWriteLock::lockForRead with no writer) hang the whole bridge.
+        # Removal is async and the projection flushes on the next save or
+        # user action; a rollback is an abort path, so nothing here may
+        # block. The document stays dirty, which is correct: the candidate
+        # layer removal is a real state change.
 
     def _paint_strokes(self, params: dict, envelope: dict) -> dict:
         document_id, document, transaction_id, _transaction, candidate = self._transaction(
