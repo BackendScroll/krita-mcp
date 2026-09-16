@@ -1150,20 +1150,29 @@ class KritaMCPExtension(Extension):
         if transaction is None:
             return
         candidate = document.nodeByUniqueID(QUuid(transaction["layer_id"]))
-        if candidate is not None:
-            candidate.remove()
         PROTOCOL_STATE.finish_transaction(transaction_id)
-        # Deliberately NON-BLOCKING. Earlier revisions called
-        # refreshProjection() + waitForDone() here (and then tried to restore
-        # the document dirty flag, a restore that never worked live -- see the
-        # runbook OPEN item). Both blocking calls sit on the Krita main thread
-        # inside KisImage::waitForDone, which is where the 2026-09-16 wedges
-        # (eu-stack: all projection-update workers blocked in
-        # QReadWriteLock::lockForRead with no writer) hang the whole bridge.
-        # Removal is async and the projection flushes on the next save or
-        # user action; a rollback is an abort path, so nothing here may
-        # block. The document stays dirty, which is correct: the candidate
-        # layer removal is a real state change.
+        if candidate is None:
+            return
+        # Deferred removal via a zero-delay timer: candidate.remove() blocks on
+        # the image scheduler (KisImage's projection-update workers holding
+        # QReadWriteLock::lockForRead), and immediately after a heavy
+        # paint_strokes batch the scheduler is saturated — the 2026-09-16
+        # wedge signature (3/3 substrate rejections wedged the main thread in
+        # the rollback path even though this handler itself is non-blocking).
+        # Posting the removal to the event loop lets the scheduler drain
+        # first, so the removal runs against an idle image. The document
+        # stays dirty either way: the removal is a real state change.
+        node_ref = candidate.uniqueId().toString()
+
+        def _remove_later() -> None:
+            try:
+                doc = document.nodeByUniqueID(QUuid(node_ref))
+                if doc is not None:
+                    doc.remove()
+            except Exception:
+                pass  # a rollback is an abort path; never let the timer crash
+
+        QTimer.singleShot(0, _remove_later)
 
     def _paint_strokes(self, params: dict, envelope: dict) -> dict:
         document_id, document, transaction_id, _transaction, candidate = self._transaction(
