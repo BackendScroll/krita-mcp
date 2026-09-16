@@ -194,6 +194,10 @@ COMMAND_QUEUE = CommandQueue()
 class _LoopbackHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    # socketserver defaults to 5. A client that abandons a request leaves its
+    # connection in the accept queue, so a handful of timeouts made the bridge
+    # permanently unreachable while Krita itself was healthy.
+    request_queue_size = 64
 
     def handle_error(self, request, client_address) -> None:
         # The default implementation prints the traceback to stderr, which is
@@ -465,7 +469,23 @@ class KritaMCPExtension(Extension):
             document_id = str(uuid.uuid4())
             self._document_ids[object_key] = document_id
             self._documents[document_id] = document
+        # Batch mode is PER DOCUMENT for save/export. Krita.instance()
+        # .setBatchmode(True) in setup() is not enough: setup() runs before any
+        # document exists, and exportImage()/saveAs() consult the document's
+        # own flag. Without this, exportImage() raises the PNG export options
+        # dialog and blocks the main thread forever -- observed live on
+        # 2026-09-16, where it presented as a bridge_stall on export_document
+        # that no client timeout could have resolved.
+        self._set_batchmode(document)
         return document_id
+
+    @staticmethod
+    def _set_batchmode(document) -> None:
+        """Best-effort: never let a missing binding break a command."""
+        try:
+            document.setBatchmode(True)
+        except Exception:
+            log_unhandled_error(None, "setBatchmode")
 
     def _forget_document(self, document_id: str) -> None:
         document = self._documents.pop(document_id, None)
@@ -663,6 +683,7 @@ class KritaMCPExtension(Extension):
             path = PATH_GUARD.resolve_write(requested)
             if path.suffix.lower() != ".kra":
                 raise ProtocolError("invalid_format", "save_document requires a .kra path")
+            self._set_batchmode(document)
             ok = document.saveAs(str(path))
         else:
             if not document.fileName():
@@ -670,6 +691,7 @@ class KritaMCPExtension(Extension):
             path = PATH_GUARD.resolve_write(document.fileName())
             if path.suffix.lower() != ".kra":
                 raise ProtocolError("invalid_format", "save_document requires a .kra path")
+            self._set_batchmode(document)
             ok = document.save()
         if not ok:
             raise ProtocolError("save_failed", "Krita could not save the KRA document")
@@ -680,8 +702,18 @@ class KritaMCPExtension(Extension):
         path = PATH_GUARD.resolve_write(params.get("path", ""))
         if path.suffix.lower() != ".png":
             raise ProtocolError("invalid_format", "export_document currently requires a .png path")
+        # Every PNG property must be specified. Krita asks for anything left
+        # unset via a modal options dialog, which on a headless bridge means
+        # the main thread never returns.
         configuration = InfoObject()
         configuration.setProperty("alpha", True)
+        configuration.setProperty("compression", 3)
+        configuration.setProperty("indexed", False)
+        configuration.setProperty("interlaced", False)
+        configuration.setProperty("saveSRGBProfile", True)
+        configuration.setProperty("forceSRGB", False)
+        configuration.setProperty("transparencyFillcolor", [255, 255, 255])
+        self._set_batchmode(document)
         if not document.exportImage(str(path), configuration):
             raise ProtocolError("export_failed", "Krita could not export the PNG")
         return {
@@ -1204,10 +1236,13 @@ class KritaMCPExtension(Extension):
             for stroke in strokes:
                 result = self._paint_one(document, candidate, view, stroke)
                 if trace_directory is not None:
-                    # The crop must reflect this stroke, so refresh once per
-                    # traced stroke. Refreshing here (not in _paint_one) keeps
-                    # untraced painting runs free of waitForDone entirely.
-                    document.refreshProjection()
+                    # NO refreshProjection() here. Refreshing once per traced
+                    # stroke is what starved the bridge's accept loop (Recv-Q
+                    # climbing while the main thread sat idle in do_sys_poll).
+                    # _save_projection below reads the projection directly; a
+                    # trace may lag by a stroke, which is acceptable for an
+                    # animation frame. Correctness-critical captures go through
+                    # _capture_region, which refreshes explicitly.
                     trace_path = trace_directory / f"{stroke['stroke_id']}.png"
                     capture = self._save_projection(
                         document, str(trace_path), result["bbox"], None
@@ -1301,6 +1336,19 @@ class KritaMCPExtension(Extension):
                 or bbox[3] <= 0
             ):
                 raise ProtocolError("invalid_capture", "bbox must be [x, y, width, height]")
+        # The projection MUST be current or the caller reads a stale canvas.
+        # AutoPainter's critic compares a before/after capture pair; with
+        # tracing off nothing refreshed, so it judged two identical images and
+        # rejected every candidate. Measured 2026-09-16: the form_value_planes
+        # phase was rejected 60/60 with improvement ~0.00003 against a 0.001
+        # gate, and contributed zero strokes to the finished painting.
+        #
+        # One refresh per capture, NOT per stroke: the per-traced-stroke
+        # refresh that used to live in _paint_strokes ran thousands of times a
+        # run and is what starved the accept loop. A capture happens once per
+        # candidate, so the exposure is ~1/42 of that.
+        document.refreshProjection()
+        document.waitForDone()
         capture = self._save_projection(
             document,
             params.get("path", ""),

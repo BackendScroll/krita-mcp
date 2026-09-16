@@ -231,10 +231,14 @@ if __name__ == "__main__":
 
 class RefreshProjectionContractTests(unittest.TestCase):
     """refreshProjection blocks in KisImage::waitForDone, which pops a modal
-    busy-wait dialog whose nested event loop starves accept() (the live stall
-    captured with py-spy on 2026-09-16). The stroke hot loop must therefore
-    never call it; only trace captures, which genuinely need a current
-    projection, may."""
+    busy-wait dialog whose nested event loop starves accept().
+
+    Revised 2026-09-16 (night) after a live reproduction: Recv-Q climbed on
+    :5678 while Krita's main thread sat idle in do_sys_poll at 0.0% CPU, so
+    per-stroke refreshes were removed from the stroke loop entirely. The
+    refresh now happens ONCE per capture_region -- roughly 1/42 of the old
+    exposure -- which is also the only place correctness demands it, since a
+    stale projection makes the critic compare two identical images."""
 
     @classmethod
     def setUpClass(cls):
@@ -265,23 +269,54 @@ class RefreshProjectionContractTests(unittest.TestCase):
             "thousands-fold",
         )
 
-    def test_traced_strokes_refresh_before_capture(self):
+    def test_traced_strokes_do_not_refresh_in_the_stroke_loop(self):
+        """Inverted 2026-09-16. The per-traced-stroke refreshProjection() was
+        the accept-loop starver: Recv-Q climbed on :5678 while Krita's main
+        thread sat idle in do_sys_poll at 0.0% CPU, and the bridge answered
+        nothing until Krita was restarted. A trace may now lag by one stroke,
+        which is fine for an animation frame. Correctness-critical captures go
+        through _capture_region, which refreshes explicitly -- pinned by
+        test_capture_region_refreshes_before_saving below.
+        """
         func = self._function("_paint_strokes")
-        trace_branches = [
-            node
-            for node in ast.walk(func)
-            if isinstance(node, ast.If)
-            and "trace_directory" in ast.dump(node.test)
-            and "None" in ast.dump(node.test)
-        ]
-        self.assertTrue(trace_branches, "the trace branch must exist")
-        refreshed = any(
-            "refreshProjection" in self._called_attributes(node)
-            for branch in trace_branches
-            for node in ast.walk(branch)
+        self.assertNotIn(
+            "refreshProjection",
+            self._called_attributes(func),
+            "_paint_strokes runs once per stroke; refreshing here starves the "
+            "HTTP accept loop",
         )
-        self.assertTrue(
-            refreshed,
-            "trace crops must refresh the projection before capture, "
-            "inside the trace branch",
-        )
+
+    def test_capture_region_refreshes_before_saving(self):
+        """A capture must never read a stale projection. With tracing off
+        nothing refreshed, so AutoPainter's critic compared two identical
+        images: the form_value_planes phase was rejected 60/60 with
+        improvement ~0.00003 against a 0.001 gate and contributed no strokes.
+        """
+        func = self._function("_capture_region")
+        called = self._called_attributes(func)
+        self.assertIn("refreshProjection", called)
+        self.assertIn("waitForDone", called)
+
+    def test_documents_enter_batch_mode(self):
+        """exportImage()/saveAs() consult the DOCUMENT's batch flag, not the
+        application's. Krita.instance().setBatchmode(True) in setup() runs
+        before any document exists, so without this the PNG export options
+        dialog blocks the main thread forever -- observed live 2026-09-16 as a
+        bridge_stall on export_document that no client timeout could clear.
+        """
+        self.assertIn("setBatchmode", self._called_attributes(self._function("_set_batchmode")))
+        for name in ("_register_document", "_export_document", "_save_document"):
+            self.assertIn(
+                "_set_batchmode",
+                self._called_attributes(self._function(name)),
+                f"{name} must put the document in batch mode before it can raise a dialog",
+            )
+
+    def test_png_export_specifies_every_property(self):
+        """Anything left unset is what Krita opens a modal dialog to ask."""
+        source = self.source
+        for prop in (
+            "alpha", "compression", "indexed", "interlaced",
+            "saveSRGBProfile", "forceSRGB", "transparencyFillcolor",
+        ):
+            self.assertIn(f'setProperty("{prop}"', source, f"PNG export must set {prop}")
