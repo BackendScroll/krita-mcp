@@ -24,7 +24,7 @@ SPEC.loader.exec_module(protocol)
 class EnvelopeTests(unittest.TestCase):
     def request(self, **overrides):
         value = {
-            "protocol_version": 4,
+            "protocol_version": 5,
             "request_id": "request-1",
             "session_id": "session-1",
             "document_id": "document-1",
@@ -35,7 +35,14 @@ class EnvelopeTests(unittest.TestCase):
         value.update(overrides)
         return value
 
-    def test_rejects_non_v4_and_unknown_actions(self):
+    def test_rejects_non_v5_and_unknown_actions(self):
+        # v4 is deliberately no longer accepted: v5 is a clean cutover, not a
+        # dual-version bridge, so the previous wire version must fail exactly
+        # like any other wrong value.
+        with self.assertRaises(protocol.ProtocolError) as caught:
+            protocol.validate_request(self.request(protocol_version=4))
+        self.assertEqual(caught.exception.code, "protocol_mismatch")
+
         with self.assertRaises(protocol.ProtocolError) as caught:
             protocol.validate_request(self.request(protocol_version=3))
         self.assertEqual(caught.exception.code, "protocol_mismatch")
@@ -55,6 +62,19 @@ class EnvelopeTests(unittest.TestCase):
         read.pop("expected_revision")
         validated = protocol.validate_request(read)
         self.assertEqual(validated["action"], "get_state")
+
+        node_read = self.request(action="get_node_state", params={"node_id": "abc"})
+        node_read.pop("expected_revision")
+        validated = protocol.validate_request(node_read)
+        self.assertEqual(validated["action"], "get_node_state")
+
+    def test_validate_bbox_accepts_none_and_rejects_malformed_regions(self):
+        self.assertIsNone(protocol.validate_bbox(None))
+        self.assertEqual(protocol.validate_bbox([1, 2, 3, 4]), [1, 2, 3, 4])
+        for bad in ([1, 2, 3], [0, 0, 0, 5], [0, 0, 5, 0], [-1, 0, 5, 5], "nope", [1.5, 2, 3, 4]):
+            with self.assertRaises(protocol.ProtocolError) as caught:
+                protocol.validate_bbox(bad)
+            self.assertEqual(caught.exception.code, "invalid_capture")
 
     def test_body_size_is_bounded_before_json_decoding(self):
         with self.assertRaises(protocol.ProtocolError) as caught:
@@ -126,7 +146,7 @@ class SessionStateTests(unittest.TestCase):
             return {"created": True}
 
         request = {
-            "protocol_version": 4,
+            "protocol_version": 5,
             "request_id": "same-request",
             "session_id": "writer",
             "document_id": "doc",

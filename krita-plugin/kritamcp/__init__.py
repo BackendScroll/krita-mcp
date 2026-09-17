@@ -1,7 +1,9 @@
-"""Authenticated protocol-v4 HTTP bridge for Krita 6.
+"""Authenticated protocol-v5 HTTP bridge for Krita 6.
 
 The HTTP thread validates and queues envelopes.  Every Krita API call runs on
-the Qt main thread.  Protocol-v4 is intentionally a clean break: no legacy
+the Qt main thread.  V5 is a clean cutover from v4 (new HTTP paths, new
+protocol_version, no dual-version support) adding a unified get_state and
+per-node pixel-occupancy/content-hash queries; like v4 before it, no legacy
 action aliases or pixel-raster stroke fallbacks are registered.
 """
 
@@ -25,6 +27,7 @@ from PyQt6.QtGui import QColor, QColorSpace, QImage, QPainterPath
 
 from .protocol_v4 import (
     ACTIONS,
+    CHANNEL_DEPTH_BYTES,
     MAX_BODY_BYTES,
     MAX_QUEUE_DEPTH,
     MAX_TRACED_STROKES,
@@ -35,9 +38,12 @@ from .protocol_v4 import (
     ProtocolError,
     ProtocolState,
     brush_fingerprint,
+    content_hash,
+    count_marked_pixels,
     ensure_token,
     error_response,
     parse_json_body,
+    validate_bbox,
     validate_strokes,
 )
 
@@ -121,6 +127,13 @@ def _capabilities() -> dict:
         "unsupported_sensors": ["rotation", "speed", "tilt"],
         "transactions": "ephemeral_candidate_layer",
         "captures": "png_path",
+        "state_capture": {
+            "unified_state": "get_state",
+            "node_occupancy": "get_node_state",
+            "occupancy_source": "pixel_data",
+            "stroke_occupancy_fields": ["painted_pixels", "coverage"],
+            "node_occupancy_fields": ["marked_pixels", "coverage", "content_hash"],
+        },
         "limits": {
             "max_body_bytes": MAX_BODY_BYTES,
             "max_queue_depth": MAX_QUEUE_DEPTH,
@@ -209,7 +222,7 @@ class _LoopbackHTTPServer(ThreadingHTTPServer):
 class V4RequestHandler(BaseHTTPRequestHandler):
     """Strict HTTP surface: /health plus authenticated /v4 endpoints."""
 
-    server_version = "krita-mcp-v4"
+    server_version = "krita-mcp-v5"
     sys_version = ""
 
     def log_message(self, _format, *_args) -> None:
@@ -235,10 +248,10 @@ class V4RequestHandler(BaseHTTPRequestHandler):
             self._send({"status": "ok"})
             return
         try:
-            if self.path != "/v4/capabilities":
+            if self.path != "/v5/capabilities":
                 raise ProtocolError(
                     "protocol_mismatch",
-                    "use authenticated /v4/capabilities or /v4/command",
+                    "use authenticated /v5/capabilities or /v5/command",
                     http_status=426,
                 )
             self._authenticate()
@@ -257,10 +270,10 @@ class V4RequestHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         request_id = None
         try:
-            if self.path != "/v4/command":
+            if self.path != "/v5/command":
                 raise ProtocolError(
                     "protocol_mismatch",
-                    "only /v4/command accepts command envelopes",
+                    "only /v5/command accepts command envelopes",
                     http_status=426,
                 )
             self._authenticate()
@@ -365,7 +378,7 @@ class KritaMCPExtension(Extension):
         if self.server_thread is None:
             self.server_thread = ServerThread(SERVER_PORT)
             self.server_thread.start()
-            print(f"[KritaMCP] protocol v4 listening on {SERVER_HOST}:{SERVER_PORT}")
+            print(f"[KritaMCP] protocol v5 listening on {SERVER_HOST}:{SERVER_PORT}")
         if self.timer is None:
             self.timer = QTimer()
             self.timer.timeout.connect(self.process_commands)
@@ -429,6 +442,7 @@ class KritaMCPExtension(Extension):
         handlers = {
             "get_capabilities": self._get_capabilities,
             "get_state": self._get_state,
+            "get_node_state": self._get_node_state,
             "create_document": self._create_document,
             "open_document": self._open_document,
             "save_document": self._save_document,
@@ -552,15 +566,46 @@ class KritaMCPExtension(Extension):
         )
         return result
 
+    @staticmethod
+    def _transaction_entry(transaction_id: str, transaction: dict) -> dict:
+        return {
+            "transaction_id": transaction_id,
+            "document_id": transaction["document_id"],
+            "session_id": transaction["session_id"],
+            "candidate_layer_id": transaction["layer_id"],
+            "target_layer_id": transaction.get("target_layer_id"),
+            "label": transaction.get("label"),
+        }
+
     def _get_state(self, _params: dict, envelope: dict) -> dict:
         # Lease expiry is lazy (it runs inside obtain_writer), so a raw read of
         # writer_session reports True forever after any session has held the
         # lease — even long past the 120 s timeout. Expire before reporting.
+        # Everything read from PROTOCOL_STATE happens under one lock
+        # acquisition so the writer/transactions snapshot is internally
+        # consistent (no transaction from a session that released mid-read).
         with PROTOCOL_STATE._lock:
             PROTOCOL_STATE._expire_writer()
+            writer_session = PROTOCOL_STATE.writer_session
+            writer_last_seen = PROTOCOL_STATE.writer_last_seen
+            transactions = dict(PROTOCOL_STATE.transactions)
+        now = time.monotonic()
         result = {
             "bridge_revision": PROTOCOL_STATE.revision,
-            "writer_lease": PROTOCOL_STATE.writer_session is not None,
+            "writer_lease": writer_session is not None,
+            # None when idle; otherwise enough to answer "who holds the
+            # writer, and is it about to expire" without a second call.
+            "writer_lease_details": (
+                {
+                    "session_id": writer_session,
+                    "seconds_since_touch": round(now - writer_last_seen, 3),
+                    "seconds_remaining": round(
+                        max(0.0, PROTOCOL_STATE.session_timeout - (now - writer_last_seen)), 3
+                    ),
+                }
+                if writer_session is not None
+                else None
+            ),
         }
         try:
             document_id, document = self._document(envelope)
@@ -568,9 +613,55 @@ class KritaMCPExtension(Extension):
             if error.code != "no_active_document":
                 raise
             result["document"] = None
-        else:
-            result["document"] = self._document_state(document_id, document)
+            result["layers"] = None
+            result["transactions"] = [
+                self._transaction_entry(transaction_id, transaction)
+                for transaction_id, transaction in transactions.items()
+            ]
+            return result
+        # list_layers duplicated this tree in a second round trip; folding it
+        # in here is the point of the v5 state-capture pass -- one call for
+        # "what does the bridge think is true right now".
+        result["document"] = self._document_state(document_id, document)
+        result["layers"] = self._node_entry(document.rootNode())
+        result["transactions"] = [
+            self._transaction_entry(transaction_id, transaction)
+            for transaction_id, transaction in transactions.items()
+            if transaction["document_id"] == document_id
+        ]
         return result
+
+    def _get_node_state(self, params: dict, envelope: dict) -> dict:
+        """Node-level pixel occupancy AND content identity, on demand.
+
+        The general-purpose sibling of the per-stroke painted_pixels/coverage
+        telemetry in _paint_one: that runs automatically as a side effect of
+        painting, this runs whenever a caller wants to check a node's actual
+        content without capturing a PNG. Reads the node's own paint device
+        via _node_snapshot, never document.projection(), so it never calls
+        refreshProjection() and cannot trigger the modal busy-wait dialog
+        documented on _paint_one / _capture_region.
+        """
+        document_id, document = self._document(envelope)
+        node = self._node(document, params.get("node_id"))
+        bbox = validate_bbox(params.get("bbox")) or [0, 0, document.width(), document.height()]
+        channel_depth = self._channel_depth_bytes(document)
+        marked, total, node_content_hash = self._node_snapshot(node, bbox, channel_depth)
+        if marked >= 0:
+            coverage = round(marked / total, 6) if total else 0.0
+        else:
+            coverage = -1.0
+        return {
+            "document_id": document_id,
+            "node": self._node_entry(node),
+            "bbox": bbox,
+            # -1 / null mean "could not measure", not "painted nothing" --
+            # same convention as paint_strokes' per-stroke result.
+            "marked_pixels": marked,
+            "total_pixels": total,
+            "coverage": coverage,
+            "content_hash": node_content_hash,
+        }
 
     @staticmethod
     def _validate_canvas_size(width: int, height: int) -> tuple[int, int]:
@@ -1004,6 +1095,75 @@ class KritaMCPExtension(Extension):
         bottom = min(document.height(), int(max(point[1] for point in points) + padding) + 1)
         return [left, top, max(0, right - left), max(0, bottom - top)]
 
+    @staticmethod
+    def _read_node_pixels(node, bbox: list[int]) -> tuple[bytes | None, int]:
+        """One Node.pixelData() read, isolated so _alpha_coverage and
+        _node_snapshot share the exact same never-raises contract instead of
+        each re-implementing the try/except around it.
+
+        This reads the layer's pixels directly -- it does NOT touch the
+        composited projection, so unlike document.projection() it needs no
+        refreshProjection() and cannot trigger the busy-wait dialog that
+        deadlocks the bridge (2026-09-17 backtrace: refreshProjection ->
+        KisImage::waitForDone -> KisDelayedSaveDialog::blockIfImageIsBusy ->
+        QDialog::exec, with PyKrita holding the GIL so the HTTP thread
+        starves in take_gil).
+
+        Returns (raw_bytes_or_None, total_pixels). None means the read
+        raised -- never propagated, because this is telemetry and must not
+        be able to break a paint.
+        """
+        left, top, width, height = bbox
+        total = max(0, width) * max(0, height)
+        if total <= 0:
+            return b"", 0
+        try:
+            return bytes(node.pixelData(left, top, width, height)), total
+        except Exception:
+            return None, total
+
+    @staticmethod
+    def _alpha_coverage(node, bbox: list[int], channel_depth: int) -> tuple[int, int]:
+        """Count non-transparent pixels in bbox on this node's OWN paint
+        device. Returns (marked_pixels, total_pixels); (-1, total) means the
+        read failed or the layout was unrecognised -- that is "unmeasured",
+        not "painted nothing".
+        """
+        raw, total = KritaMCPExtension._read_node_pixels(node, bbox)
+        if total <= 0:
+            return 0, 0
+        if raw is None:
+            return -1, total
+        return count_marked_pixels(raw, total, channel_depth), total
+
+    @staticmethod
+    def _node_snapshot(
+        node, bbox: list[int], channel_depth: int
+    ) -> tuple[int, int, str | None]:
+        """Occupancy AND content identity from the same pixelData() read.
+
+        Used by get_node_state, an on-demand query -- NOT by the _paint_one
+        hot path, where hashing every stroke's bbox in a batch of dozens
+        would be pure overhead nothing reads. Returns (marked_pixels,
+        total_pixels, content_hash); content_hash is None whenever marked is
+        -1 (unmeasured), mirroring that same convention.
+        """
+        raw, total = KritaMCPExtension._read_node_pixels(node, bbox)
+        if total <= 0:
+            return 0, 0, None
+        if raw is None:
+            return -1, total, None
+        marked = count_marked_pixels(raw, total, channel_depth)
+        return marked, total, (content_hash(raw) if marked >= 0 else None)
+
+    @staticmethod
+    def _channel_depth_bytes(document) -> int:
+        try:
+            depth = str(document.colorDepth())
+        except Exception:
+            return 2
+        return CHANNEL_DEPTH_BYTES.get(depth, 2)
+
     # None until probed; then True if this Krita build's paintLine takes
     # QPoint (5.2-style bindings) rather than QPointF (master). The endpoint
     # type genuinely differs between builds, so it is detected once at
@@ -1049,6 +1209,16 @@ class KritaMCPExtension(Extension):
     def _paint_one(self, document, layer, view, stroke: dict) -> dict:
         resource = self._apply_stroke_settings(view, stroke)
         geometry = stroke["geometry"]
+        bbox = self._bbox_for_geometry(document, geometry, stroke["size"])
+        channel_depth = self._channel_depth_bytes(document)
+        # Alpha coverage on the candidate layer BEFORE the stroke, so the
+        # delta afterwards isolates what THIS stroke marked (the candidate
+        # accumulates every stroke in the batch). Without this the bridge
+        # reports a geometry-derived bbox and nothing else, so a stroke that
+        # painted nothing -- clipped away by document.setSelection(), or a
+        # preset that renders no dab at this size/pressure -- is
+        # indistinguishable from one that painted correctly.
+        before_marked, _total = self._alpha_coverage(layer, bbox, channel_depth)
         start_time = time.perf_counter()
         if geometry["type"] == "line":
             view.setDisablePressure(False)
@@ -1078,14 +1248,23 @@ class KritaMCPExtension(Extension):
         # in the hot loop multiplied that exposure thousands-fold; trace
         # captures refresh explicitly just before the capture instead.
         elapsed_ms = int((time.perf_counter() - start_time) * 1000)
+        after_marked, total_pixels = self._alpha_coverage(layer, bbox, channel_depth)
+        if before_marked >= 0 and after_marked >= 0:
+            painted_pixels = max(0, after_marked - before_marked)
+            coverage = round(painted_pixels / total_pixels, 6) if total_pixels else 0.0
+        else:
+            painted_pixels, coverage = -1, -1.0
         filename = resource.filename() or None
         return {
             "stroke_id": stroke["stroke_id"],
             "effective_brush_fingerprint": brush_fingerprint(
                 "preset", resource.name(), filename, self._resource_hash(resource)
             ),
-            "bbox": self._bbox_for_geometry(document, geometry, stroke["size"]),
+            "bbox": bbox,
             "render_ms": elapsed_ms,
+            # -1 means "could not measure", not "painted nothing".
+            "painted_pixels": painted_pixels,
+            "coverage": coverage,
         }
 
     @staticmethod
@@ -1272,6 +1451,39 @@ class KritaMCPExtension(Extension):
                     result["trace_path"] = capture["path"]
                     trace_paths.append(Path(capture["path"]))
                 results.append(result)
+            # One line per batch naming how many strokes actually put paint
+            # down. A batch that renders nothing used to be completely silent
+            # -- the bridge returned a geometry-derived bbox per stroke and
+            # the client had no way to tell paint from no-op, so a run could
+            # "succeed" at thousands of strokes while marking almost nothing.
+            measured = [item for item in results if item.get("painted_pixels", -1) >= 0]
+            if measured:
+                empty = [item for item in measured if item["painted_pixels"] == 0]
+                painted = sum(item["painted_pixels"] for item in measured)
+                log_event(
+                    "paint_strokes: %d/%d strokes marked nothing; painted_px=%d "
+                    "mean_coverage=%.4f traced=%s"
+                    % (
+                        len(empty),
+                        len(measured),
+                        painted,
+                        sum(item["coverage"] for item in measured) / len(measured),
+                        traced,
+                    )
+                )
+                if empty:
+                    sample = empty[:5]
+                    log_event(
+                        "paint_strokes: empty stroke sample %s"
+                        % [
+                            {
+                                "stroke_id": item["stroke_id"],
+                                "bbox": item["bbox"],
+                                "preset": item.get("effective_brush_fingerprint", "")[:24],
+                            }
+                            for item in sample
+                        ]
+                    )
         except Exception:
             self._rollback_internal(transaction_id, document)
             for path in trace_paths:
@@ -1348,16 +1560,7 @@ class KritaMCPExtension(Extension):
 
     def _capture_region(self, params: dict, envelope: dict) -> dict:
         document_id, document = self._document(envelope)
-        bbox = params.get("bbox")
-        if bbox is not None:
-            if (
-                not isinstance(bbox, list)
-                or len(bbox) != 4
-                or any(not isinstance(item, int) for item in bbox)
-                or bbox[2] <= 0
-                or bbox[3] <= 0
-            ):
-                raise ProtocolError("invalid_capture", "bbox must be [x, y, width, height]")
+        bbox = validate_bbox(params.get("bbox"))
         # The projection MUST be current or the caller reads a stale canvas.
         # AutoPainter's critic compares a before/after capture pair; with
         # tracing off nothing refreshed, so it judged two identical images and

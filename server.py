@@ -16,7 +16,7 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
-PROTOCOL_VERSION = 4
+PROTOCOL_VERSION = 5
 DEFAULT_KRITA_URL = "http://127.0.0.1:5678"
 _TOKEN_RE = re.compile(r"^[0-9a-f]{64}$")
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
@@ -204,7 +204,7 @@ class BridgeClient:
     async def capabilities(self) -> BridgeReply:
         request_id = str(uuid.uuid4())
         return await self._request(
-            "GET", "/v4/capabilities", request_id=request_id
+            "GET", "/v5/capabilities", request_id=request_id
         )
 
     async def command(
@@ -228,7 +228,7 @@ class BridgeClient:
         if expected_revision is not None:
             envelope["expected_revision"] = expected_revision
         return await self._request(
-            "POST", "/v4/command", request_id=request_id, body=envelope
+            "POST", "/v5/command", request_id=request_id, body=envelope
         )
 
     async def aclose(self) -> None:
@@ -237,8 +237,8 @@ class BridgeClient:
 
 BRIDGE = BridgeClient()
 mcp = FastMCP(
-    "krita-mcp-v4",
-    version="4",
+    "krita-mcp-v5",
+    version="5",
     instructions="Typed native-brush control for a local Krita 6 instance.",
     mask_error_details=True,
     strict_input_validation=True,
@@ -278,9 +278,33 @@ async def krita_get_capabilities() -> ToolResult:
 
 @mcp.tool(output_schema=OUTPUT_SCHEMA, annotations=READ_ONLY)
 async def krita_get_state(document_id: str | None = None) -> ToolResult:
-    """Get bridge revision, writer state, and optional active document state."""
+    """Get one snapshot of everything the bridge knows right now: revision,
+    writer lease (holder + seconds remaining), the document's metadata, its
+    full layer tree, and any open paint transactions on it. Supersedes a
+    get_state + list_layers pair."""
     reply = await BRIDGE.command("get_state", {}, document_id=document_id)
     return _result(reply, f"Krita state at revision {reply.document_revision}.")
+
+
+@mcp.tool(output_schema=OUTPUT_SCHEMA, annotations=READ_ONLY)
+async def krita_get_node_state(
+    document_id: str,
+    node_id: str,
+    bbox: tuple[int, int, int, int] | None = None,
+) -> ToolResult:
+    """Check whether a layer actually has paint in it, without a PNG capture.
+
+    Reads the node's own pixels directly (Node.pixelData) rather than the
+    composited projection, so it needs no refreshProjection() and cannot
+    trigger the modal-dialog deadlock that projection-based captures risk.
+    bbox defaults to the full canvas; coverage/marked_pixels are -1 when the
+    read could not be measured -- that is NOT the same as "no paint"."""
+    reply = await BRIDGE.command(
+        "get_node_state",
+        {"node_id": node_id, "bbox": list(bbox) if bbox else None},
+        document_id=document_id,
+    )
+    return _result(reply, "Retrieved node pixel-occupancy state.")
 
 
 @mcp.tool(output_schema=OUTPUT_SCHEMA, annotations=WRITE)

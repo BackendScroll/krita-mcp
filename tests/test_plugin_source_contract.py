@@ -16,9 +16,13 @@ class PluginSourceContractTests(unittest.TestCase):
         cls.source = SOURCE_PATH.read_text(encoding="utf-8")
         cls.tree = ast.parse(cls.source)
 
-    def test_only_v4_http_surface_is_registered(self):
-        self.assertIn('"/v4/capabilities"', self.source)
-        self.assertIn('"/v4/command"', self.source)
+    def test_only_v5_http_surface_is_registered(self):
+        self.assertIn('"/v5/capabilities"', self.source)
+        self.assertIn('"/v5/command"', self.source)
+        # v5 is a clean cutover, not a dual-version bridge: the old v4 paths
+        # must not still be accepted anywhere in the routing.
+        self.assertNotIn('"/v4/capabilities"', self.source)
+        self.assertNotIn('"/v4/command"', self.source)
         self.assertNotIn('"native_paint_path"', self.source)
         self.assertNotIn('"batch_actions"', self.source)
         self.assertNotIn('"new_canvas"', self.source)
@@ -335,6 +339,18 @@ class RefreshProjectionContractTests(unittest.TestCase):
                 self._called_attributes(self._function(name)),
                 f"{name} must put the document in batch mode before it can raise a dialog",
             )
+
+    def test_state_capture_actions_never_touch_the_projection(self):
+        """get_state and get_node_state exist so a caller can check what the
+        bridge/document/node actually contain without paying the deadlock
+        risk of a projection-based capture. If either ever grows a
+        refreshProjection()/waitForDone() call, that guarantee is gone."""
+        for name in ("_get_state", "_get_node_state"):
+            called = self._called_attributes(self._function(name))
+            self.assertNotIn(
+                "refreshProjection", called, f"{name} must stay projection-free"
+            )
+            self.assertNotIn("waitForDone", called, f"{name} must stay projection-free")
 
     def test_png_export_specifies_every_property(self):
         """Anything left unset is what Krita opens a modal dialog to ask."""

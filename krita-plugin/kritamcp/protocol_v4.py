@@ -18,8 +18,8 @@ import time
 from typing import Any, Callable, Iterable
 
 
-PROTOCOL_VERSION = 4
-PLUGIN_VERSION = "v4"
+PROTOCOL_VERSION = 5
+PLUGIN_VERSION = "v5"
 MAX_BODY_BYTES = 2 * 1024 * 1024
 MAX_QUEUE_DEPTH = 64
 MAX_TRACED_STROKES = 32
@@ -30,6 +30,7 @@ READ_ACTIONS = frozenset(
     {
         "get_capabilities",
         "get_state",
+        "get_node_state",
         "list_layers",
         "list_brushes",
         "capture_region",
@@ -114,7 +115,7 @@ def validate_request(value: Any) -> dict[str, Any]:
     if value.get("protocol_version") != PROTOCOL_VERSION:
         raise ProtocolError(
             "protocol_mismatch",
-            "only Krita MCP protocol version 4 is accepted",
+            f"only Krita MCP protocol version {PROTOCOL_VERSION} is accepted",
             details={
                 "expected": PROTOCOL_VERSION,
                 "received": value.get("protocol_version"),
@@ -334,6 +335,68 @@ def validate_strokes(strokes: Any, traced: bool) -> list[dict[str, Any]]:
             )
         normalized.append(item)
     return normalized
+
+
+def validate_bbox(value: Any) -> list[int] | None:
+    """Validate an optional [x, y, width, height] region.
+
+    Shared by every state-capture action (`capture_region`, `get_node_state`)
+    so "what counts as a legal bbox" cannot drift between them.
+    """
+    if value is None:
+        return None
+    if (
+        not isinstance(value, (list, tuple))
+        or len(value) != 4
+        or any(not isinstance(item, int) or isinstance(item, bool) for item in value)
+    ):
+        raise ProtocolError("invalid_capture", "bbox must be [x, y, width, height]")
+    x, y, width, height = value
+    if x < 0 or y < 0 or width <= 0 or height <= 0:
+        raise ProtocolError(
+            "invalid_capture", "bbox x/y must be non-negative and width/height positive"
+        )
+    return [int(x), int(y), int(width), int(height)]
+
+
+CHANNEL_DEPTH_BYTES = {"U8": 1, "U16": 2, "F16": 2, "F32": 4}
+
+
+def count_marked_pixels(raw: bytes, total_pixels: int, channel_depth: int) -> int:
+    """Count pixels with any non-zero alpha in a Node.pixelData() buffer.
+
+    Pure byte arithmetic, kept here so it is unit-testable: the plugin
+    module itself cannot be imported outside Krita. Layout is RGBA with
+    alpha last, `channel_depth` bytes per channel.
+
+    Returns -1 when the buffer cannot be interpreted -- callers treat that
+    as "unmeasured", which is NOT the same as "painted nothing".
+    """
+    if total_pixels <= 0:
+        return 0
+    if not raw:
+        return -1
+    stride = len(raw) // total_pixels
+    if stride * total_pixels != len(raw) or stride < channel_depth * 4:
+        return -1
+    alpha_start = stride - channel_depth
+    marked = 0
+    for base in range(alpha_start, len(raw), stride):
+        if any(raw[base : base + channel_depth]):
+            marked += 1
+    return marked
+
+
+def content_hash(raw: bytes) -> str:
+    """A stable identity for a Node.pixelData() buffer.
+
+    Distinct from occupancy (count_marked_pixels): two reads with identical
+    coverage can still differ in content (a region repainted a different
+    color, or a stroke undone and redone identically-shaped but
+    differently-colored). Callers compare this across two reads to detect
+    that, without needing to keep the raw buffer around.
+    """
+    return "sha256:" + hashlib.sha256(raw).hexdigest()
 
 
 def brush_fingerprint(

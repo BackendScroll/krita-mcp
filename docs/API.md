@@ -1,5 +1,10 @@
 # Krita MCP protocol v4
 
+> Superseded by [`API_v5.md`](./API_v5.md), which documents every action's
+> actual request/response shape (this file only covers the envelope and
+> constraints) and the pixel-coverage measurement added to `paint_strokes`.
+> Kept here for history; don't extend this file further.
+
 ## HTTP endpoints
 
 - `GET /health` — generic, unauthenticated liveness.

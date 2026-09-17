@@ -25,6 +25,7 @@ SPEC.loader.exec_module(server)
 EXPECTED_TOOLS = {
     "krita_get_capabilities",
     "krita_get_state",
+    "krita_get_node_state",
     "krita_create_document",
     "krita_open_document",
     "krita_save_document",
@@ -59,6 +60,7 @@ class SchemaTests(unittest.IsolatedAsyncioTestCase):
         tools = await server.mcp.list_tools(run_middleware=False)
         by_name = {tool.name: tool for tool in tools}
         self.assertTrue(by_name["krita_get_state"].annotations.read_only_hint)
+        self.assertTrue(by_name["krita_get_node_state"].annotations.read_only_hint)
         self.assertFalse(by_name["krita_create_document"].annotations.read_only_hint)
         self.assertTrue(by_name["krita_delete_layer"].annotations.destructive_hint)
         self.assertTrue(
