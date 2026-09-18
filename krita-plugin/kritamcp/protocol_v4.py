@@ -34,6 +34,7 @@ READ_ACTIONS = frozenset(
         "list_layers",
         "list_brushes",
         "capture_region",
+        "get_canvas_state",
     }
 )
 WRITE_ACTIONS = frozenset(
