@@ -1345,6 +1345,15 @@ class KritaMCPExtension(Extension):
         # in the hot loop multiplied that exposure thousands-fold; trace
         # captures refresh explicitly just before the capture instead.
         elapsed_ms = int((time.perf_counter() - start_time) * 1000)
+        # Flush the image scheduler BEFORE the pixel read. paintLine/paintPath
+        # apply asynchronously; without a flush the before/after buffers can
+        # both read pre-stroke state, so a real stroke reports painted_px=0
+        # and the trace diff is byte-identical (live-verified 2026-09-18: the
+        # stroke was on canvas in capture_region while painted_pixels read 0).
+        # waitForDone, not refreshProjection: the projection is not needed
+        # here and the modal busy-wait exposure stays with the explicit
+        # capture path.
+        document.waitForDone()
         # One pixelData read for both telemetry and the trace diff.
         raw_after, total_pixels = self._read_node_pixels(layer, bbox)
         after_marked = (
@@ -1392,10 +1401,14 @@ class KritaMCPExtension(Extension):
 
     @staticmethod
     def _srgb8_projection(document, bbox: list[int] | None = None) -> QImage:
-        if bbox is None:
-            image = document.projection()
-        else:
-            image = document.projection(*bbox)
+        # projection() with no arguments returns a null QImage on this
+        # build (binding quirk); always pass an explicit rect.
+        rect = (
+            bbox
+            if bbox is not None
+            else [0, 0, document.width(), document.height()]
+        )
+        image = document.projection(*rect)
         if image.isNull():
             raise ProtocolError("capture_failed", "Krita returned an empty projection")
         srgb = QColorSpace(QColorSpace.NamedColorSpace.SRgb)
