@@ -378,3 +378,59 @@ class RefreshProjectionContractTests(unittest.TestCase):
             "saveSRGBProfile", "forceSRGB", "transparencyFillcolor",
         ):
             self.assertIn(f'setProperty("{prop}"', source, f"PNG export must set {prop}")
+
+
+class CloseDocumentSavePolicyContractTests(unittest.TestCase):
+    """close_document must answer Krita's native "save changes?" dialog
+    through an explicit save_policy instead of a modal that blocks accept()."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.source = SOURCE_PATH.read_text(encoding="utf-8")
+        cls.tree = ast.parse(cls.source)
+        cls.fn = next(
+            node
+            for node in ast.walk(cls.tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "_close_document"
+        )
+        cls.texts = [
+            ast.unparse(node)
+            for node in ast.walk(cls.fn)
+            if isinstance(node, (ast.Constant, ast.Compare, ast.If, ast.Raise, ast.Return))
+        ]
+        cls.blob = "\n".join(cls.texts)
+
+    def test_policy_is_validated_before_any_krita_mutation(self):
+        self.assertIn("'save', 'discard', 'cancel'", self.blob.replace('"', "'"))
+
+    def test_cancel_policy_returns_unsaved_changes_instead_of_raising(self):
+        self.assertIn("unsaved_changes", self.blob)
+        self.assertIn("'closed': False", self.blob.replace('"', "'"))
+
+    def test_save_policy_never_reaches_a_modal(self):
+        # save-then-close must go through document.save()/saveAs(); a never-
+        # saved document must refuse with unsaved_document_needs_path rather
+        # than open Krita's Save As dialog on the main thread.
+        self.assertIn("unsaved_document_needs_path", self.blob)
+        src = self.source.split("def _close_document")[1].split("def _get_canvas_state")[0]
+        self.assertIn("PATH_GUARD.resolve_write", src)
+        self.assertIn("document.saveAs(str(path))", src)
+        self.assertIn("document.save()", src)
+
+    def test_get_canvas_state_is_read_only(self):
+        fn = next(
+            node
+            for node in ast.walk(self.tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "_get_canvas_state"
+        )
+        called = [
+            child.func.attr
+            for child in ast.walk(fn)
+            if isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute)
+        ]
+        self.assertNotIn("refreshProjection", called)
+        self.assertNotIn("setModified", called)
+        self.assertNotIn("close", called)
+
+    def test_get_canvas_state_surfaces_the_active_document(self):
+        self.assertIn("active_document_id", SOURCE_PATH.read_text(encoding="utf-8"))

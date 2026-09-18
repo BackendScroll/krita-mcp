@@ -449,6 +449,7 @@ class KritaMCPExtension(Extension):
             "save_document": self._save_document,
             "export_document": self._export_document,
             "close_document": self._close_document,
+            "get_canvas_state": self._get_canvas_state,
             "list_layers": self._list_layers,
             "create_layer": self._create_layer,
             "update_layer": self._update_layer,
@@ -814,19 +815,104 @@ class KritaMCPExtension(Extension):
             "color_depth": document.colorDepth(),
         }
 
-    def _close_document(self, _params: dict, envelope: dict) -> dict:
+    def _close_document(self, params: dict, envelope: dict) -> dict:
         document_id, document = self._document(envelope)
+        save_policy = str(params.get("save_policy") or "cancel")
+        if save_policy not in {"save", "discard", "cancel"}:
+            raise ProtocolError(
+                "invalid_save_policy",
+                "save_policy must be one of: save, discard, cancel",
+            )
         for transaction_id, transaction in list(PROTOCOL_STATE.transactions.items()):
             if transaction["document_id"] == document_id:
                 self._rollback_internal(transaction_id, document)
+        dirty = document.modified()
+        if dirty and save_policy == "cancel":
+            # The user-visible equivalent of pressing Cancel on Krita's native
+            # "save changes?" dialog: the tab stays open, nothing is lost.
+            return {
+                "document_id": document_id,
+                "closed": False,
+                "reason": "unsaved_changes",
+                "modified": True,
+            }
+        if dirty and save_policy == "save":
+            if document.fileName():
+                # Known file on disk: save in place, never raise a dialog.
+                if not document.save():
+                    raise ProtocolError("save_failed", "Krita could not save the document")
+            else:
+                requested = params.get("save_as_path")
+                if not requested:
+                    raise ProtocolError(
+                        "unsaved_document_needs_path",
+                        "document has never been saved; pass save_as_path "
+                        "to choose where the save goes",
+                    )
+                # Guard-checked BEFORE saving so a path outside the configured
+                # roots cannot reach Krita's Save As dialog.
+                path = PATH_GUARD.resolve_write(requested)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                if not document.saveAs(str(path)):
+                    raise ProtocolError("save_failed", f"Krita could not save to {path}")
         # document.close() blocks forever on Krita's native "save changes?"
         # dialog for a modified document; batch mode alone does not suppress
         # it in this Krita build, so the dirty flag must be cleared first.
+        # Only the "discard" branch reaches close() while still dirty.
         document.setModified(False)
         if not document.close():
             raise ProtocolError("close_failed", "Krita refused to close the document")
         self._forget_document(document_id)
         return {"document_id": document_id, "closed": True}
+
+    def _get_canvas_state(self, _params: dict, envelope: dict) -> dict:
+        """One read-only answer to "what does Krita's workspace look like":
+        every open document/tab (with which one is active), and the active
+        view's paint settings. Pairs with capture_region for the pixels.
+        Agent-safe: no refresh, no mutation, never raises on odd states."""
+        app = self._app()
+        window = app.activeWindow()
+        active_view = window.activeView() if window else None
+        active_document = app.activeDocument()
+        entries = []
+        for document in app.documents():
+            document_id = self._document_ids.get(id(document))
+            if document_id is None:
+                document_id = self._register_document(document)
+            entries.append(
+                {
+                    "document_id": document_id,
+                    "name": document.name(),
+                    "file_name": document.fileName(),
+                    "modified": document.modified(),
+                    "width": document.width(),
+                    "height": document.height(),
+                    "active": active_document is not None and document == active_document,
+                }
+            )
+        view_info = None
+        if active_view is not None:
+            preset = None
+            try:
+                resource = active_view.currentBrushPreset()
+                preset = resource.name() if resource is not None else None
+            except Exception:
+                preset = None  # a half-initialised view must not fail the read
+            view_info = {
+                "brush_preset": preset,
+                "brush_size": active_view.brushSize(),
+                "painting_opacity": active_view.paintingOpacity(),
+                "painting_flow": active_view.paintingFlow(),
+                "blending_mode": active_view.currentBlendingMode(),
+                "eraser_mode": active_view.eraserMode(),
+            }
+        return {
+            "documents": entries,
+            "active_document_id": self._document_ids.get(id(active_document)) if active_document else None,
+            "window_count": 1 if window else 0,
+            "view_count": len(window.views()) if window else 0,
+            "view": view_info,
+        }
 
     def _list_layers(self, _params: dict, envelope: dict) -> dict:
         document_id, document = self._document(envelope)
