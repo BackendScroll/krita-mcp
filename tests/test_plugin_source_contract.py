@@ -273,26 +273,23 @@ class RefreshProjectionContractTests(unittest.TestCase):
             "thousands-fold",
         )
 
-    def test_traced_strokes_refresh_before_capture(self):
-        """Re-inverted 2026-09-17, same night as the removal above.
+    def test_traced_strokes_capture_without_refreshing_the_projection(self):
+        """Re-inverted 2026-09-18: the per-stroke trace is now the byte diff
+        of the candidate layer's pixelData bbox (trace_diff_rgba), which
+        never touches the projection -- so refreshProjection() is gone from
+        the traced-stroke path entirely.
 
-        Without the refresh, a meaningful fraction of trace crops came back
-        showing no stroke mark at all (std=0.00, perfectly uniform colour --
-        measured on run 20260916T220226Z), and the accumulated composite
-        diverged from preview.png enough to fail build_stroke_gif's SSIM >=
-        0.98 gate on an otherwise fully-painted, 8-phase run.
-
-        The 2026-09-16 removal was correct given what was known then, but
-        the accept-loop starvation it was defending against turned out to
-        have a different root cause: a MODAL DIALOG (the PNG export options
-        dialog, confirmed by the user watching Krita), not this call by
-        itself. Two of that dialog's known triggers are closed independently
-        -- stop_krita clears ~/.krita-*-autosave.kra
-        (autopainter/services.py), and every document now enters batch mode
-        at registration (test_documents_enter_batch_mode below) -- so the
-        refresh is restored. If Recv-Q climbs again with this in place, that
-        is new evidence a third dialog trigger exists; capture it with
-        py-spy/eu-stack before removing this a second time.
+        History: the refresh was restored 2026-09-17 because without it a
+        meaningful fraction of projection trace crops came back showing no
+        stroke mark (std=0.00, run 20260916T220226Z) and the composite
+        failed build_stroke_gif's SSIM >= 0.98 gate. The 2026-09-17 gdb
+        backtrace then proved refreshProjection itself blocks in
+        KisImage::waitForDone behind a MODAL busy-wait dialog holding the
+        GIL -- it killed run 20260917T072117Z with 4 bridge_stalls. The
+        pixelData diff answers the same staleness problem with no projection
+        read at all. refreshProjection may only appear in _paint_strokes'
+        FALLBACK branch (eraser strokes and diff failures), which cannot be
+        the default path.
         """
         func = self._function("_paint_strokes")
         trace_branches = [
@@ -303,16 +300,37 @@ class RefreshProjectionContractTests(unittest.TestCase):
             and "None" in ast.dump(node.test)
         ]
         self.assertTrue(trace_branches, "the trace branch must exist")
-        refreshed = any(
-            "refreshProjection" in self._called_attributes(node)
-            for branch in trace_branches
-            for node in ast.walk(branch)
+        # Every trace-branch If whose TEST does not name the fallback (i.e.
+        # the fast, default path) must be projection-free.
+        for branch in trace_branches:
+            if "trace_path" in ast.dump(branch.test):
+                continue  # the fallback branch: erase strokes / failed diffs
+            for node in ast.walk(branch):
+                self.assertNotIn(
+                    "refreshProjection",
+                    self._called_attributes(node) if isinstance(node, ast.Call) else [],
+                    "the default traced path must not refresh the projection",
+                )
+        # And the diff function must actually be in play (bare-name import,
+        # so match Name calls, not attribute calls).
+        name_calls = [
+            child.func.id
+            for child in ast.walk(self._function("_paint_one"))
+            if isinstance(child, ast.Call) and isinstance(child.func, ast.Name)
+        ]
+        self.assertIn(
+            "trace_diff_rgba",
+            name_calls,
+            "_paint_one must derive the trace from the pixelData diff",
         )
-        self.assertTrue(
-            refreshed,
-            "trace crops must refresh the projection before capture, "
-            "inside the trace branch",
-        )
+
+    def test_trace_diff_fallback_only_for_erase_or_failed_diff(self):
+        """The projection-capture fallback must be gated on erase strokes or
+        a missing trace_path -- never run for the ordinary stroke."""
+        source = self._function("_paint_strokes")
+        dump = ast.dump(source)
+        self.assertIn("erase", dump)
+        self.assertIn("refreshProjection", dump)  # fallback kept, gated above
 
     def test_capture_region_refreshes_before_saving(self):
         """A capture must never read a stale projection. With tracing off

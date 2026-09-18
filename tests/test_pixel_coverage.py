@@ -112,3 +112,63 @@ def test_content_hash_distinguishes_same_coverage_different_content():
         same_coverage_b, 2, 2
     )
     assert content_hash(same_coverage_a) != content_hash(same_coverage_b)
+
+
+# --- trace_diff_rgba (2026-09-18: per-stroke trace via pixelData diff) ---
+
+trace_diff_rgba = protocol.trace_diff_rgba
+
+
+def _bgra_u16(pixels: list[tuple[int, int, int, int]]) -> bytes:
+    """Build an RGBA/U16 buffer in Krita's real storage order -- B, G, R, A
+    (see _fill_u16 in the plugin, which packs blue, green, red, alpha)."""
+    out = bytearray()
+    for b, g, r, a in pixels:
+        out += b.to_bytes(2, "little")
+        out += g.to_bytes(2, "little")
+        out += r.to_bytes(2, "little")
+        out += a.to_bytes(2, "little")
+    return bytes(out)
+
+
+def test_trace_diff_only_changed_pixels_carry_color():
+    before = _bgra_u16([(0, 0, 0, 0)] * 3)
+    after = _bgra_u16([(0, 0, 0, 0), (0, 0, 65535, 65535), (0, 0, 0, 0)])
+    out = trace_diff_rgba(before, after, 3, 2)
+    assert out is not None and len(out) == 3 * 4
+    # Pixel 0 unchanged -> fully transparent.
+    assert out[0:4] == b"\x00\x00\x00\x00"
+    # Pixel 1: red stroke at full opacity, downshifted to 8 bit, BGRA order.
+    assert out[4] == 0  # B
+    assert out[5] == 0  # G
+    assert out[6] == 255  # R
+    assert out[7] == 255  # A
+    # Pixel 2 unchanged.
+    assert out[8:12] == b"\x00\x00\x00\x00"
+
+
+def test_trace_diff_unsupported_depth_returns_none():
+    raw = b"\x00" * 16
+    assert trace_diff_rgba(raw, raw, 1, 4) is None
+
+
+def test_trace_diff_mismatched_buffers_return_none():
+    a = _bgra_u16([(0, 0, 0, 0)] * 2)
+    b = _bgra_u16([(0, 0, 0, 0)] * 3)
+    assert trace_diff_rgba(a, b, 2, 2) is None
+    assert trace_diff_rgba(None, a, 2, 2) is None
+    assert trace_diff_rgba(b"", a, 2, 2) is None
+
+
+def test_trace_diff_u8_no_downshift():
+    before = bytes([0, 0, 0, 0] * 2)
+    after = bytes([0, 0, 0, 0]) + bytes([0, 255, 0, 128])
+    out = trace_diff_rgba(before, after, 2, 1)
+    assert out[0:4] == b"\x00\x00\x00\x00"
+    assert out[4:8] == bytes([0, 255, 0, 128])  # B,G,R,A unchanged at 8 bit
+
+
+def test_trace_diff_identical_buffers_all_transparent():
+    raw = _bgra_u16([(10, 20, 30, 65535)] * 5)
+    out = trace_diff_rgba(raw, raw, 5, 2)
+    assert out == b"\x00" * (5 * 4)

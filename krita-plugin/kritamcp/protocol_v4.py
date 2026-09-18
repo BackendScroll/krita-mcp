@@ -387,6 +387,70 @@ def count_marked_pixels(raw: bytes, total_pixels: int, channel_depth: int) -> in
     return marked
 
 
+def trace_diff_rgba(
+    raw_before: bytes | None,
+    raw_after: bytes | None,
+    total_pixels: int,
+    channel_depth: int,
+) -> bytes | None:
+    """Per-stroke trace: byte diff of one Node.pixelData() bbox, before vs
+    after the stroke.
+
+    Replaces the per-stroke document.refreshProjection() + projection-crop
+    capture that used to sit in the traced path. refreshProjection blocks in
+    KisImage::waitForDone behind a MODAL busy-wait dialog (2026-09-17 gdb
+    backtrace), holding the GIL so the bridge's accept thread starves; the
+    pixelData read needs no projection at all.
+
+    The caller snapshots the bbox BEFORE and AFTER the stroke; this returns
+    an 8-bit buffer, 4 bytes/pixel in QImage.Format_ARGB32 memory order
+    (B, G, R, A -- matching Krita's RGBA/U16 storage order, see _fill_u16),
+    where every CHANGED pixel carries the after-state (downshifted to 8 bit
+    when channel_depth > 1) and every unchanged pixel is fully transparent.
+    Composited with alpha over the accumulating canvas, this reproduces the
+    same animation frames the projection crops did -- and an OPAQUE crop
+    composites identically to the old region-replace, so the client keeps
+    one code path and old runs' trace PNGs stay resumable.
+
+    Known limit: an eraser stroke lowers alpha, which alpha-compositing
+    cannot subtract from the canvas; callers must fall back to the
+    projection capture for erase batches (see _paint_strokes).
+
+    Returns None when the buffers cannot be interpreted -- callers treat
+    that as "capture failed" and fall back, never as a broken paint.
+    """
+    if total_pixels <= 0:
+        return None
+    if not raw_before or not raw_after or len(raw_before) != len(raw_after):
+        return None
+    stride = len(raw_before) // total_pixels
+    if stride * total_pixels != len(raw_before) or stride < channel_depth * 4:
+        return None
+    # Only integer storage (U8/U16) has a meaningful downshift; F16/F32
+    # buffers are not supported here -- callers fall back to the projection
+    # capture.
+    if channel_depth not in (1, 2):
+        return None
+    shift = 8 * (channel_depth - 1)
+    out = bytearray(total_pixels * 4)
+    for base in range(0, total_pixels * stride, stride):
+        before = raw_before[base : base + stride]
+        after = raw_after[base : base + stride]
+        if before != after:
+            # U16 storage is little-endian (struct.pack("=H", ...)), so the
+            # 8-bit downshift must read the whole channel, not one byte.
+            blue = (int.from_bytes(after[0:channel_depth], "little") >> shift) & 0xFF
+            green = (int.from_bytes(after[channel_depth : channel_depth * 2], "little") >> shift) & 0xFF
+            red = (int.from_bytes(after[channel_depth * 2 : channel_depth * 3], "little") >> shift) & 0xFF
+            alpha = (int.from_bytes(after[channel_depth * 3 : channel_depth * 4], "little") >> shift) & 0xFF
+            obase = (base // stride) * 4
+            out[obase] = blue
+            out[obase + 1] = green
+            out[obase + 2] = red
+            out[obase + 3] = alpha
+    return bytes(out)
+
+
 def content_hash(raw: bytes) -> str:
     """A stable identity for a Node.pixelData() buffer.
 

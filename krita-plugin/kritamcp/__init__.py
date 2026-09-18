@@ -43,6 +43,7 @@ from .protocol_v4 import (
     ensure_token,
     error_response,
     parse_json_body,
+    trace_diff_rgba,
     validate_bbox,
     validate_strokes,
 )
@@ -1206,7 +1207,7 @@ class KritaMCPExtension(Extension):
                 "ForegroundColor",
             )
 
-    def _paint_one(self, document, layer, view, stroke: dict) -> dict:
+    def _paint_one(self, document, layer, view, stroke: dict, trace_path=None) -> dict:
         resource = self._apply_stroke_settings(view, stroke)
         geometry = stroke["geometry"]
         bbox = self._bbox_for_geometry(document, geometry, stroke["size"])
@@ -1218,7 +1219,17 @@ class KritaMCPExtension(Extension):
         # painted nothing -- clipped away by document.setSelection(), or a
         # preset that renders no dab at this size/pressure -- is
         # indistinguishable from one that painted correctly.
-        before_marked, _total = self._alpha_coverage(layer, bbox, channel_depth)
+        # When tracing, the raw buffer is kept so the trace is the byte diff
+        # of this same read -- no second capture, no projection involved.
+        if trace_path is not None:
+            raw_before, total = self._read_node_pixels(layer, bbox)
+            before_marked = (
+                count_marked_pixels(raw_before, total, channel_depth)
+                if raw_before is not None
+                else -1
+            )
+        else:
+            before_marked, total = self._alpha_coverage(layer, bbox, channel_depth)
         start_time = time.perf_counter()
         if geometry["type"] == "line":
             view.setDisablePressure(False)
@@ -1248,14 +1259,20 @@ class KritaMCPExtension(Extension):
         # in the hot loop multiplied that exposure thousands-fold; trace
         # captures refresh explicitly just before the capture instead.
         elapsed_ms = int((time.perf_counter() - start_time) * 1000)
-        after_marked, total_pixels = self._alpha_coverage(layer, bbox, channel_depth)
+        # One pixelData read for both telemetry and the trace diff.
+        raw_after, total_pixels = self._read_node_pixels(layer, bbox)
+        after_marked = (
+            count_marked_pixels(raw_after, total_pixels, channel_depth)
+            if raw_after is not None
+            else -1
+        )
         if before_marked >= 0 and after_marked >= 0:
             painted_pixels = max(0, after_marked - before_marked)
             coverage = round(painted_pixels / total_pixels, 6) if total_pixels else 0.0
         else:
             painted_pixels, coverage = -1, -1.0
         filename = resource.filename() or None
-        return {
+        result = {
             "stroke_id": stroke["stroke_id"],
             "effective_brush_fingerprint": brush_fingerprint(
                 "preset", resource.name(), filename, self._resource_hash(resource)
@@ -1266,6 +1283,26 @@ class KritaMCPExtension(Extension):
             "painted_pixels": painted_pixels,
             "coverage": coverage,
         }
+        if trace_path is not None:
+            diff = trace_diff_rgba(raw_before, raw_after, total_pixels, channel_depth)
+            if diff is not None:
+                self._write_trace_png(diff, bbox, trace_path)
+                result["trace_path"] = str(trace_path)
+            # else: capture failed -- _paint_strokes falls back to the
+            # projection capture for this stroke, so a missing trace is
+            # never silently accepted by the animation builder.
+        return result
+
+    @staticmethod
+    def _write_trace_png(bgra: bytes, bbox: list[int], path) -> None:
+        """Write one per-stroke trace diff as a PNG. `bgra` is the 8-bit
+        Format_ARGB32-ordered buffer produced by trace_diff_rgba; keep the
+        PNG fully specified so nothing can raise a modal dialog on save."""
+        left, top, width, height = bbox
+        image = QImage(bgra, width, height, width * 4, QImage.Format.Format_ARGB32)
+        if image.save(str(path), "PNG"):
+            return
+        raise ProtocolError("capture_failed", "Krita could not save the trace PNG")
 
     @staticmethod
     def _srgb8_projection(document, bbox: list[int] | None = None) -> QImage:
@@ -1413,36 +1450,33 @@ class KritaMCPExtension(Extension):
                 "foreground": view.foregroundColor(),
             }
             for stroke in strokes:
-                result = self._paint_one(document, candidate, view, stroke)
-                if trace_directory is not None:
-                    # Restored 2026-09-17 (removed earlier the same night).
-                    # Without this, _save_projection below reads a stale
-                    # projection: a meaningful fraction of trace crops came
-                    # back showing no stroke mark at all (std=0.00, perfectly
-                    # uniform colour -- measured live on run
-                    # 20260916T220226Z), and the accumulated composite
-                    # diverged from preview.png enough to fail
-                    # build_stroke_gif's SSIM >= 0.98 gate on an otherwise
-                    # fully-painted, 8-phase run.
-                    #
-                    # The earlier removal traded that correctness for safety
-                    # against the accept-loop starvation this same refresh
-                    # caused during the 2026-09-16 wedge investigation -- but
-                    # that investigation's root cause was a MODAL DIALOG
-                    # (confirmed by the user watching Krita: the PNG export
-                    # options dialog), not refreshProjection() itself. A
-                    # dialog's nested event loop is what starves accept();
-                    # this refresh only starves it if something is blocking
-                    # behind a dialog while it runs. Two of that condition's
-                    # known triggers are now closed: stop_krita clears
-                    # ~/.krita-*-autosave.kra (autopainter/services.py), so
-                    # the autosave-recovery dialog should not be armed, and
-                    # every document now enters batch mode at registration
-                    # (see _register_document), which is what the export
-                    # dialog was actually missing. If Recv-Q climbs again
-                    # with this restored, that is new evidence a THIRD dialog
-                    # trigger exists -- capture it via py-spy/eu-stack rather
-                    # than re-removing this blind.
+                if trace_directory is None or stroke.get("erase"):
+                    result = self._paint_one(document, candidate, view, stroke)
+                else:
+                    # Traced, non-erase: the trace is the byte diff of the
+                    # candidate layer's pixelData bbox before/after the
+                    # stroke. NO refreshProjection() here -- it blocks in
+                    # KisImage::waitForDone behind a MODAL busy-wait dialog
+                    # (2026-09-17 gdb backtrace:
+                    # refreshProjection -> KisDelayedSaveDialog::blockIfImageIsBusy
+                    # -> QDialog::exec) holding the GIL so the accept thread
+                    # starves. The pixelData read never touches the
+                    # projection. Client-side _trace_composite alpha-composites
+                    # the diff over the accumulating canvas; build_stroke_gif's
+                    # SSIM gate verifies equivalence against preview.png.
+                    trace_path = trace_directory / f"{stroke['stroke_id']}.png"
+                    result = self._paint_one(
+                        document, candidate, view, stroke, trace_path=trace_path
+                    )
+                    if "trace_path" in result:
+                        trace_paths.append(Path(result["trace_path"]))
+                if trace_directory is not None and "trace_path" not in result:
+                    # Fallback capture for eraser strokes (alpha-compositing
+                    # cannot subtract paint from the canvas) and for any
+                    # stroke whose pixelData diff failed. This is the ONLY
+                    # place the projection is refreshed in the stroke path:
+                    # once per stroke that actually needs it, not per stroke
+                    # painted.
                     document.refreshProjection()
                     trace_path = trace_directory / f"{stroke['stroke_id']}.png"
                     capture = self._save_projection(
