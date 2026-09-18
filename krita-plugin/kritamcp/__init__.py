@@ -25,7 +25,7 @@ from krita import Extension, InfoObject, Krita, ManagedColor, Selection
 from PyQt6.QtCore import QByteArray, QPointF, QRect, Qt, QThread, QTimer, QUuid
 from PyQt6.QtGui import QColor, QColorSpace, QImage, QPainterPath
 
-from .protocol_v4 import (
+from .protocol_v5 import (
     ACTIONS,
     CHANNEL_DEPTH_BYTES,
     MAX_BODY_BYTES,

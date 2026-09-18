@@ -19,11 +19,11 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
-# Load protocol_v4 directly: importing the kritamcp PACKAGE pulls in
+# Load protocol_v5 directly: importing the kritamcp PACKAGE pulls in
 # __init__.py, which imports the `krita` module and only exists inside a
-# running Krita. Same approach as test_protocol_v4.py.
-MODULE_PATH = Path(__file__).parents[1] / "krita-plugin" / "kritamcp" / "protocol_v4.py"
-SPEC = importlib.util.spec_from_file_location("krita_protocol_v4_coverage", MODULE_PATH)
+# running Krita. Same approach as test_protocol_v5.py.
+MODULE_PATH = Path(__file__).parents[1] / "krita-plugin" / "kritamcp" / "protocol_v5.py"
+SPEC = importlib.util.spec_from_file_location("krita_protocol_v5_coverage", MODULE_PATH)
 protocol = importlib.util.module_from_spec(SPEC)
 assert SPEC and SPEC.loader
 SPEC.loader.exec_module(protocol)

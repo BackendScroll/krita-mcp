@@ -13,9 +13,9 @@ MODULE_PATH = (
     Path(__file__).parents[1]
     / "krita-plugin"
     / "kritamcp"
-    / "protocol_v4.py"
+    / "protocol_v5.py"
 )
-SPEC = importlib.util.spec_from_file_location("krita_protocol_v4", MODULE_PATH)
+SPEC = importlib.util.spec_from_file_location("krita_protocol_v5", MODULE_PATH)
 protocol = importlib.util.module_from_spec(SPEC)
 assert SPEC and SPEC.loader
 SPEC.loader.exec_module(protocol)
