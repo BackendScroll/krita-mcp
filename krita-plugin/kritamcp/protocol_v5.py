@@ -737,3 +737,57 @@ class ProtocolState:
                     dict(response),
                 )
             return response
+
+
+SETTLE_TIMEOUT_SECONDS = 60.0
+SETTLE_POLL_SECONDS = 0.005
+DEFAULT_RESULT_TIMEOUT_SECONDS = 180.0
+MAX_RESULT_TIMEOUT_SECONDS = 600.0
+
+
+def wait_until_idle(
+    try_lock: Callable[[], bool],
+    unlock: Callable[[], None],
+    *,
+    timeout: float = SETTLE_TIMEOUT_SECONDS,
+    interval: float = SETTLE_POLL_SECONDS,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> bool:
+    """Wait for the image scheduler to drain without KisImage::waitForDone.
+
+    waitForDone() on the GUI thread notifies KisBusyWaitBroker, which raises
+    Krita's MODAL busy-wait dialog once the wait passes ~1 s; its nested
+    event loop starves the bridge (2026-09-17 gdb backtrace, frames #9-#13).
+    Document.tryBarrierLock() checks the same scheduler state without ever
+    reaching the broker, so polling it is the dialog-free equivalent.
+
+    Returns True once the barrier lock was acquired (and released again),
+    False when ``timeout`` elapses first.
+    """
+    deadline = clock() + max(0.0, timeout)
+    while True:
+        if try_lock():
+            unlock()
+            return True
+        if clock() >= deadline:
+            return False
+        sleep(interval)
+
+
+def result_timeout(header: str | None) -> float:
+    """Bridge-side wait for one command, from the client's own budget.
+
+    The client sends ``X-Krita-MCP-Timeout`` (seconds) so the bridge stops
+    waiting when the client does, instead of a fixed 180 s; a missing or
+    malformed header keeps the old default.
+    """
+    if header is None:
+        return DEFAULT_RESULT_TIMEOUT_SECONDS
+    try:
+        value = float(header)
+    except ValueError:
+        return DEFAULT_RESULT_TIMEOUT_SECONDS
+    if not (value > 0) or value != value:
+        return DEFAULT_RESULT_TIMEOUT_SECONDS
+    return min(value, MAX_RESULT_TIMEOUT_SECONDS)

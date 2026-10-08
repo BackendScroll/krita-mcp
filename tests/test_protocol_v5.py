@@ -232,3 +232,56 @@ class TokenTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SettleTests(unittest.TestCase):
+    def fake_clock(self):
+        now = [0.0]
+
+        def clock():
+            return now[0]
+
+        def sleep(seconds):
+            now[0] += seconds
+
+        return clock, sleep
+
+    def test_idle_image_settles_immediately_and_releases_the_lock(self):
+        unlocked = []
+        clock, sleep = self.fake_clock()
+        self.assertTrue(
+            protocol.wait_until_idle(lambda: True, lambda: unlocked.append(1), sleep=sleep, clock=clock)
+        )
+        self.assertEqual(unlocked, [1])
+
+    def test_busy_image_settles_once_the_scheduler_drains(self):
+        answers = iter([False, False, True])
+        unlocked = []
+        clock, sleep = self.fake_clock()
+        self.assertTrue(
+            protocol.wait_until_idle(
+                lambda: next(answers), lambda: unlocked.append(1), interval=0.01, sleep=sleep, clock=clock
+            )
+        )
+        self.assertEqual(unlocked, [1])
+
+    def test_never_idle_times_out_without_unlocking(self):
+        unlocked = []
+        clock, sleep = self.fake_clock()
+        self.assertFalse(
+            protocol.wait_until_idle(
+                lambda: False, lambda: unlocked.append(1), timeout=1.0, interval=0.1, sleep=sleep, clock=clock
+            )
+        )
+        self.assertEqual(unlocked, [])
+        self.assertGreaterEqual(clock(), 1.0)
+
+
+class ResultTimeoutTests(unittest.TestCase):
+    def test_missing_or_bad_header_keeps_the_default(self):
+        for header in (None, "", "abc", "0", "-3", "nan"):
+            self.assertEqual(protocol.result_timeout(header), protocol.DEFAULT_RESULT_TIMEOUT_SECONDS)
+
+    def test_client_budget_is_used_and_capped(self):
+        self.assertEqual(protocol.result_timeout("15"), 15.0)
+        self.assertEqual(protocol.result_timeout("1e9"), protocol.MAX_RESULT_TIMEOUT_SECONDS)

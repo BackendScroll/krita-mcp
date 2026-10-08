@@ -34,6 +34,7 @@ from .protocol_v5 import (
     MAX_UNTRACED_STROKES,
     PLUGIN_VERSION,
     PROTOCOL_VERSION,
+    SETTLE_TIMEOUT_SECONDS,
     PathGuard,
     ProtocolError,
     ProtocolState,
@@ -43,9 +44,11 @@ from .protocol_v5 import (
     ensure_token,
     error_response,
     parse_json_body,
+    result_timeout,
     trace_diff_rgba,
     validate_bbox,
     validate_strokes,
+    wait_until_idle,
 )
 
 
@@ -189,6 +192,10 @@ class CommandQueue:
         if not event.wait(timeout):
             with self._lock:
                 self._results.pop(queue_id, None)
+                # The client has stopped waiting: a command still in the
+                # queue must not run later against a document the client has
+                # moved on from (a stale write after a timeout).
+                self._pending = [entry for entry in self._pending if entry[0] != queue_id]
             raise ProtocolError(
                 "command_timeout",
                 "Krita did not finish the command before the bridge timeout",
@@ -294,7 +301,11 @@ class V4RequestHandler(BaseHTTPRequestHandler):
             envelope = parse_json_body(self.rfile.read(content_length), content_length)
             request_id = envelope["request_id"]
             queue_id = COMMAND_QUEUE.push(envelope)
-            self._send(COMMAND_QUEUE.get_result(queue_id))
+            self._send(
+                COMMAND_QUEUE.get_result(
+                    queue_id, result_timeout(self.headers.get("X-Krita-MCP-Timeout"))
+                )
+            )
         except ProtocolError as error:
             self._fail(error, request_id)
 
@@ -946,7 +957,7 @@ class KritaMCPExtension(Extension):
             raise ProtocolError("layer_create_failed", "Krita could not attach the new layer")
         if params.get("select", True):
             document.setActiveNode(node)
-        document.refreshProjection()
+        self._settle(document)
         return {
             "document_id": document_id,
             "node": self._node_entry(node),
@@ -971,7 +982,12 @@ class KritaMCPExtension(Extension):
             node.setOpacity(opacity)
         if "blend_mode" in params:
             node.setBlendingMode(str(params["blend_mode"]))
-        document.refreshProjection()
+        if {"visible", "opacity", "blend_mode"} & params.keys():
+            # Compositing properties may not dirty the projection on their
+            # own; a rename (AutoPainter's only use) needs no refresh at all.
+            document.refreshProjection()
+        else:
+            self._settle(document)
         return {"document_id": document_id, "node": self._node_entry(node)}
 
     def _delete_layer(self, params: dict, envelope: dict) -> dict:
@@ -993,7 +1009,7 @@ class KritaMCPExtension(Extension):
                 )
         if not node.remove():
             raise ProtocolError("layer_delete_failed", "Krita could not delete the layer")
-        document.refreshProjection()
+        self._settle(document)
         return {"document_id": document_id, "deleted_node_id": node_id}
 
     def _flatten_layer(self, params: dict, envelope: dict) -> dict:
@@ -1011,12 +1027,12 @@ class KritaMCPExtension(Extension):
             )
         name = node.name()
         document.setActiveNode(node)
-        document.waitForDone()
+        self._settle(document)
         action = self._app().action("flatten_layer")
         if action is None:
             raise ProtocolError("flatten_failed", "flatten_layer action unavailable")
         action.trigger()
-        document.waitForDone()
+        self._settle(document)
         replacement = document.activeNode()
         if replacement is None:
             raise ProtocolError("flatten_failed", "Krita did not return a flattened layer")
@@ -1024,7 +1040,7 @@ class KritaMCPExtension(Extension):
         # semantic ordering survives the collapse.
         if replacement.name() != name:
             replacement.setName(name)
-        document.refreshProjection()
+        self._settle(document)
         return {
             "document_id": document_id,
             "node_id": replacement.uniqueId().toString(),
@@ -1071,7 +1087,7 @@ class KritaMCPExtension(Extension):
             if mask_node.type() != "selectionmask":
                 raise ProtocolError("invalid_mask_node", "node is not a selection mask")
             mask_node.setSelection(selection.duplicate())
-        document.refreshProjection()
+        self._settle(document)
         return {
             "document_id": document_id,
             "path": str(path),
@@ -1293,6 +1309,28 @@ class KritaMCPExtension(Extension):
                 "ForegroundColor",
             )
 
+    def _settle(self, document, timeout: float = SETTLE_TIMEOUT_SECONDS) -> None:
+        """Block until the image scheduler is idle, never via waitForDone.
+
+        Document.waitForDone() and refreshProjection() both end in
+        KisImage::waitForDone, whose busy-wait broker raises a MODAL dialog
+        after ~1 s; the dialog's nested event loop starved the bridge
+        (2026-09-17 gdb backtrace). Polling tryBarrierLock() reaches the
+        same idle state without the broker. Every flush on the command path
+        goes through here; see test_no_unguarded_scheduler_waits.
+        """
+        try_lock = getattr(document, "tryBarrierLock", None)
+        if try_lock is None:
+            document.waitForDone()
+            return
+        if not wait_until_idle(try_lock, document.unlock, timeout=timeout):
+            raise ProtocolError(
+                "image_busy",
+                f"Krita's image scheduler did not go idle within {timeout:.0f} s",
+                retryable=True,
+                http_status=503,
+            )
+
     def _paint_one(self, document, layer, view, stroke: dict, trace_path=None) -> dict:
         resource = self._apply_stroke_settings(view, stroke)
         geometry = stroke["geometry"]
@@ -1353,7 +1391,7 @@ class KritaMCPExtension(Extension):
         # waitForDone, not refreshProjection: the projection is not needed
         # here and the modal busy-wait exposure stays with the explicit
         # capture path.
-        document.waitForDone()
+        self._settle(document)
         # One pixelData read for both telemetry and the trace diff.
         raw_after, total_pixels = self._read_node_pixels(layer, bbox)
         after_marked = (
@@ -1474,7 +1512,7 @@ class KritaMCPExtension(Extension):
         transaction["target_layer_id"] = target.uniqueId().toString()
         transaction["label"] = str(params.get("label") or "candidate")
         transaction["was_modified"] = was_modified
-        document.refreshProjection()
+        self._settle(document)
         return {
             "document_id": document_id,
             "transaction_id": transaction_id,
@@ -1572,11 +1610,10 @@ class KritaMCPExtension(Extension):
                 if trace_directory is not None and "trace_path" not in result:
                     # Fallback capture for eraser strokes (alpha-compositing
                     # cannot subtract paint from the canvas) and for any
-                    # stroke whose pixelData diff failed. This is the ONLY
-                    # place the projection is refreshed in the stroke path:
-                    # once per stroke that actually needs it, not per stroke
-                    # painted.
-                    document.refreshProjection()
+                    # stroke whose pixelData diff failed. The projection is
+                    # read here, so the scheduler must be idle first -- via
+                    # _settle, never refreshProjection/waitForDone.
+                    self._settle(document)
                     trace_path = trace_directory / f"{stroke['stroke_id']}.png"
                     capture = self._save_projection(
                         document, str(trace_path), result["bbox"], None
@@ -1654,14 +1691,13 @@ class KritaMCPExtension(Extension):
             # merge_layer action operates on the same active-node context
             # through the application's real merge pipeline and succeeds
             # where the low-level Node API does not.
-            document.refreshProjection()
-            document.waitForDone()
+            self._settle(document)
             document.setActiveNode(candidate)
             action = self._app().action("merge_layer")
             if action is None:
                 raise ProtocolError("transaction_commit_failed", "merge_layer action unavailable")
             action.trigger()
-            document.waitForDone()
+            self._settle(document)
             replacement = document.activeNode()
             if replacement is None or replacement.name().startswith(TRANSACTION_PREFIX):
                 raise ProtocolError("transaction_commit_failed", "candidate mergeDown failed")
@@ -1672,7 +1708,7 @@ class KritaMCPExtension(Extension):
         else:
             raise ProtocolError("invalid_commit_mode", "commit mode must be merge or retain")
         PROTOCOL_STATE.finish_transaction(transaction_id)
-        document.refreshProjection()
+        self._settle(document)
         return {
             "document_id": document_id,
             "transaction_id": transaction_id,
@@ -1705,8 +1741,7 @@ class KritaMCPExtension(Extension):
         # refresh that used to live in _paint_strokes ran thousands of times a
         # run and is what starved the accept loop. A capture happens once per
         # candidate, so the exposure is ~1/42 of that.
-        document.refreshProjection()
-        document.waitForDone()
+        self._settle(document)
         capture = self._save_projection(
             document,
             params.get("path", ""),
@@ -1772,13 +1807,12 @@ class KritaMCPExtension(Extension):
             )
         finally:
             layer.remove()
-            document.refreshProjection()
-            # remove() and refreshProjection() are asynchronous: the image
+            # remove() is asynchronous: the image
             # scheduler finishes the removal and re-marks the document dirty
             # *after* the call returns. Without this flush, the setModified
             # below lands too early and is immediately undone -- measured, the
             # document still read modified=True on the next command.
-            document.waitForDone()
+            self._settle(document)
             if previous["preset"] is not None:
                 view.setCurrentBrushPreset(previous["preset"])
             view.setBrushSize(previous["size"])

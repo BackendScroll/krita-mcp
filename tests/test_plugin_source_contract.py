@@ -194,9 +194,9 @@ class PluginSourceContractTests(unittest.TestCase):
         # ROLLBACK IS THE EXCEPTION: it must not block at all -- see
         # test_rollback_must_not_block. The probe keeps the flush+restore.
         calls = self._called_attributes(self._function("_render_brush_probe"))
-        self.assertIn("waitForDone", calls, "the probe must flush async work")
+        self.assertIn("_settle", calls, "the probe must flush async work")
         self.assertLess(
-            calls.index("waitForDone"),
+            calls.index("_settle"),
             calls.index("setModified"),
             "the probe must flush before restoring the dirty flag",
         )
@@ -330,7 +330,7 @@ class RefreshProjectionContractTests(unittest.TestCase):
         source = self._function("_paint_strokes")
         dump = ast.dump(source)
         self.assertIn("erase", dump)
-        self.assertIn("refreshProjection", dump)  # fallback kept, gated above
+        self.assertIn("_save_projection", dump)  # fallback kept, gated above
 
     def test_capture_region_refreshes_before_saving(self):
         """A capture must never read a stale projection. With tracing off
@@ -340,8 +340,37 @@ class RefreshProjectionContractTests(unittest.TestCase):
         """
         func = self._function("_capture_region")
         called = self._called_attributes(func)
-        self.assertIn("refreshProjection", called)
-        self.assertIn("waitForDone", called)
+        self.assertIn("_settle", called)
+        self.assertLess(called.index("_settle"), called.index("_save_projection"))
+
+    def test_no_unguarded_scheduler_waits(self):
+        """Document.waitForDone()/refreshProjection() end in
+        KisImage::waitForDone, whose busy-wait broker raises a MODAL dialog
+        after ~1 s (2026-09-17 backtrace, frames #9-#13) -- and df686fb's
+        per-stroke waitForDone put that exposure back in the stroke loop.
+        Every flush goes through _settle (tryBarrierLock polling). Allowed
+        exceptions: _settle's own fallback for a binding without
+        tryBarrierLock, document creation (setPixelData needs a real
+        refresh, once per run), and update_layer's compositing-property
+        branch, which AutoPainter never sends."""
+        allowed = {"_settle", "_create_document", "_update_layer"}
+        offenders = []
+        for node in ast.walk(self.tree):
+            if isinstance(node, ast.FunctionDef) and node.name not in allowed:
+                called = {
+                    child.func.attr
+                    for child in ast.walk(node)
+                    if isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute)
+                }
+                if called & {"waitForDone", "refreshProjection"}:
+                    offenders.append(node.name)
+        self.assertEqual(offenders, [])
+
+    def test_bridge_wait_follows_the_client_budget(self):
+        self.assertIn('self.headers.get("X-Krita-MCP-Timeout")', self.source)
+        get_result = self._function("get_result")
+        # a command the client gave up on must not run later
+        self.assertIn("_pending", ast.dump(get_result))
 
     def test_documents_enter_batch_mode(self):
         """exportImage()/saveAs() consult the DOCUMENT's batch flag, not the
